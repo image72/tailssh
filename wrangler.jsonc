@@ -2,12 +2,10 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "tailssh",
   "compatibility_date": "2026-02-25",
-  "main": "src/worker.js",
   "assets": {
     "directory": "./public",
     "not_found_handling": "single-page-application"
   },
-  // No secrets required: the browser WASM node authenticates interactively
-  // and the device list comes from its own netmap.
-  "vars": {}
+  // No secrets and no server-side code: the browser WASM node authenticates
+  // interactively and the device list comes from its own netmap.
 }

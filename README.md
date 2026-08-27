@@ -77,11 +77,12 @@ npm run build        # vendors pkg.js / main.wasm / pkg.css into public/
 
 ## Deployment
 
-### 1. Create the Worker
+### 1. First deploy
 
-If this is your first deploy, Wrangler will create the Worker automatically.
-The name is set in `wrangler.jsonc` (`"name": "tailssh"`). Change it there if
-you want a different subdomain.
+If this is your first deploy, Wrangler will create the project automatically.
+There is no server-side code — the deployment is pure static assets served by
+Cloudflare's Workers infrastructure. The name is set in `wrangler.jsonc`
+(`"name": "tailssh"`). Change it there if you want a different subdomain.
 
 ### 2. Deploy
 
@@ -112,8 +113,8 @@ up to 50 users) before sharing the URL with anyone.
 
 ## Security notes
 
-- The Worker holds **no secrets and no Tailscale credentials** — it is a
-  static asset host plus a liveness endpoint.
+- There is **no server-side code, no secrets and no Tailscale credentials** —
+  the deployment is pure static assets.
 - Each browser session creates an **ephemeral** Tailscale node under the
   identity the visitor logs in with; the node disappears from that tailnet
   automatically when the tab is closed.
@@ -133,9 +134,7 @@ up to 50 users) before sharing the URL with anyone.
 tailssh/
 ├── build.js            # Asset vendor script — see below
 ├── package.json
-├── wrangler.jsonc      # Cloudflare Workers config
-├── src/
-│   └── worker.js       # Cloudflare Worker (static host + /api/healthz)
+├── wrangler.jsonc      # Cloudflare config (assets-only, no server code)
 └── public/
     ├── index.html
     ├── style.css
