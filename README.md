@@ -140,7 +140,7 @@ before turning it on.
 ```html
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' https://unpkg.com/alpinejs@3.16.3 'wasm-unsafe-eval';
+  script-src 'self' 'wasm-unsafe-eval';
   style-src 'self';
   img-src 'self' data:;
   font-src 'self';
@@ -154,7 +154,7 @@ Why each part:
 
 | Directive | Rationale |
 |---|---|
-| `script-src 'self' https://unpkg.com/alpinejs@3.16.3 'wasm-unsafe-eval'` | `app.js` / `pkg.js` are same-origin; Alpine loads from an exactly-pinned unpkg URL (a floating `@3` would redirect to whatever is latest — supply-chain drift). The Go runtime needs `'wasm-unsafe-eval'` to compile `main.wasm`. Self-hosting Alpine would let us drop unpkg entirely. |
+| `script-src 'self' 'wasm-unsafe-eval'` | `app.js` / `pkg.js` / the vendored Alpine (`public/alpine.esm.js`, pinned to 3.16.3 — no third-party script origin at all) are same-origin. The Go runtime needs `'wasm-unsafe-eval'` to compile `main.wasm`. |
 | `connect-src 'self' https://*.tailscale.com wss://*.tailscale.com https://log.tailscale.io` | Verified against a captured session HAR (2026-08). The browser node talks to `controlplane.tailscale.com` (netmap + a persistent `wss://` watch connection), the DERP relays (https polling + `wss://` relays, hosts like `derp18d.tailscale.com` — still `*.tailscale.com`), and `log.tailscale.io` (runtime logs — note the **tailscale.io** domain, not tailscale.com). Tailnet traffic (SSH, peerapi latency probes) is *tunneled inside* the DERP connections — the HAR shows **zero** browser-level requests to `100.x` addresses, so no per-device exceptions are needed. The explicit `wss://` entries guard against browsers not honoring the CSP `https → wss` scheme upgrade. |
 | `style-src 'self'` | Requires migrating the `<noscript>` fallback out of its inline `<style>` first (e.g. an `html.no-js` class toggle); otherwise `'unsafe-inline'` would be needed. |
 | `object-src 'none'`, `base-uri 'self'`, `form-action 'self'` | Cheap hardening — the page has no plugins, forms, or scriptable bases. |
@@ -169,8 +169,9 @@ Why each part:
    to `connect-src`.
 3. ~~Confirm no other browser-level origins are contacted~~ — resolved by the
    session HAR: the complete origin inventory is `self` (workers.dev),
-   `unpkg.com` (Alpine), `*.tailscale.com` (control / DERP) and
-   `log.tailscale.io` (logs). Re-verify after any dependency change.
+   `*.tailscale.com` (control / DERP) and `log.tailscale.io` (logs). Alpine
+   has since been vendored (`public/alpine.esm.js`), removing the unpkg
+   origin the HAR still shows. Re-verify after any dependency change.
 
 ### Recommended rollout
 
@@ -206,6 +207,7 @@ tailssh/
     ├── index.html
     ├── style.css
     ├── app.js          # Browser entry point
+    ├── alpine.esm.js   # Vendored Alpine 3.16.3 (no third-party script origin)
     ├── pkg.js          # @tailscale/connect ESM bundle (build output)
     ├── main.wasm       # Tailscale WASM binary (build output)
     └── pkg.css         # xterm.js base styles (build output)

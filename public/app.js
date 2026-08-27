@@ -12,7 +12,7 @@
  * and login URLs are external data, so no innerHTML/x-html anywhere.
  */
 
-import Alpine from "https://unpkg.com/alpinejs@3.16.3/dist/module.esm.js";
+import Alpine from "./alpine.esm.js";
 import { createIPN, runSSHSession } from "./pkg.js";
 
 // ─── WASM environment patch ──────────────────────────────────────────────────
