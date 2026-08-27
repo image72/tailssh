@@ -392,6 +392,10 @@ Alpine.data("tailssh", () => ({
     this.ipn.logout();
   },
 
+  openLoginUrl() {
+    if (this.auth.url) window.open(this.auth.url, "_blank", "noopener,noreferrer");
+  },
+
   onBeforeUnload(event) {
     if (Object.keys(this.sessions).length === 0) return;
     event.preventDefault();
