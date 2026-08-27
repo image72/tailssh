@@ -2,11 +2,13 @@
 
 A 100% browser-based SSH terminal to Tailscale machines using Tailscale's WASM, deployed with Cloudflare Workers.
 
-> **This is internal-use software.**
-> There is no authentication layer in front of the app itself. Whoever can reach
-> the deployed URL can attempt to start a Tailscale session under your tailnet.
-> **Do not deploy to a public domain without adding access controls** (e.g.
-> Cloudflare Access, IP allowlisting, or keeping the Worker route private).
+> **Access controls recommended.**
+> The app itself has no login wall and holds no Tailscale credentials: each
+> visitor's browser WASM node joins **whatever tailnet the visitor logs in
+> with** (as an ephemeral node), and they only see the devices their own
+> identity permits. A stranger reaching the URL cannot touch your tailnet —
+> but consider Cloudflare Access if you don't want the Worker acting as a
+> public WASM host.
 
 ---
 
@@ -58,16 +60,7 @@ npm run build        # vendors pkg.js / main.wasm / pkg.css into public/
 
 ## Local development
 
-1. Create `.dev.vars` in the project root (this file is gitignored):
-
-   ```
-   TS_API_TOKEN=tskey-api-<your-token-here>
-   ```
-
-   Generate a token at <https://login.tailscale.com/admin/settings/keys> —
-   scope it to read-only for devices.
-
-2. Start the local dev server:
+1. Start the local dev server:
 
    ```sh
    npm run dev
@@ -75,8 +68,10 @@ npm run build        # vendors pkg.js / main.wasm / pkg.css into public/
 
    Wrangler serves the app at `http://localhost:8787`.
 
-3. Open `http://localhost:8787` in your browser. The Tailscale WASM node will
-   boot, open a Tailscale login tab, and authenticate as an ephemeral node.
+2. Open `http://localhost:8787` in your browser. The Tailscale WASM node will
+   boot, open a Tailscale login tab, and authenticate as an ephemeral node
+   under **your** Tailscale account. The device list is then populated from
+   the netmap that node receives — no API token is needed anywhere.
 
 ---
 
@@ -88,16 +83,7 @@ If this is your first deploy, Wrangler will create the Worker automatically.
 The name is set in `wrangler.jsonc` (`"name": "tailssh"`). Change it there if
 you want a different subdomain.
 
-### 2. Set the API token secret
-
-```sh
-npx wrangler secret put TS_API_TOKEN
-# Paste your tskey-api-… token when prompted
-```
-
-The token is stored encrypted in Cloudflare and is never exposed to the browser.
-
-### 3. Deploy
+### 2. Deploy
 
 ```sh
 npm run deploy
@@ -109,7 +95,7 @@ Wrangler will print the deployed URL, which will be:
 https://tailssh.<your-cf-subdomain>.workers.dev
 ```
 
-### 4. Custom domain (optional)
+### 3. Custom domain (optional)
 
 To use your own domain instead of the `*.workers.dev` URL:
 
@@ -126,10 +112,14 @@ up to 50 users) before sharing the URL with anyone.
 
 ## Security notes
 
-- The `TS_API_TOKEN` secret is only used server-side in the Worker to call
-  `GET /api/devices`. It is never sent to the browser.
-- Each browser session creates an **ephemeral** Tailscale node that disappears
-  from your tailnet automatically when the tab is closed.
+- The Worker holds **no secrets and no Tailscale credentials** — it is a
+  static asset host plus a liveness endpoint.
+- Each browser session creates an **ephemeral** Tailscale node under the
+  identity the visitor logs in with; the node disappears from that tailnet
+  automatically when the tab is closed.
+- The device list comes from the ephemeral node's own netmap, so it only ever
+  contains peers the logged-in user's tailnet ACLs let them see. Users see
+  their own tailnet — never the deployer's.
 - SSH credentials are certificate-based via Tailscale SSH — no passwords are
   stored or transmitted by this app.
 - Tailscale ACLs govern which users can SSH into which machines. TailSSH does
@@ -144,9 +134,8 @@ tailssh/
 ├── build.js            # Asset vendor script — see below
 ├── package.json
 ├── wrangler.jsonc      # Cloudflare Workers config
-├── .dev.vars           # Local secrets — gitignored
 ├── src/
-│   └── worker.js       # Cloudflare Worker (API proxy)
+│   └── worker.js       # Cloudflare Worker (static host + /api/healthz)
 └── public/
     ├── index.html
     ├── style.css

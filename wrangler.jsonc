@@ -7,8 +7,7 @@
     "directory": "./public",
     "not_found_handling": "single-page-application"
   },
-  // TS_API_TOKEN is a secret — never commit the value.
-  // Local dev:  add  TS_API_TOKEN=tskey-api-…  to .dev.vars
-  // Production: run  npx wrangler secret put TS_API_TOKEN
+  // No secrets required: the browser WASM node authenticates interactively
+  // and the device list comes from its own netmap.
   "vars": {}
 }
