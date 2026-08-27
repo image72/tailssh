@@ -369,6 +369,11 @@ html, body {
 .online-badge.online::before  { background: var(--green); }
 .online-badge.offline { color: var(--muted); }
 .online-badge.offline::before { background: var(--muted); }
+.online-badge.unknown { color: var(--muted); }
+.online-badge.unknown::before {
+  background: transparent;
+  border: 1.5px solid var(--muted);
+}
 
 .connect-btn {
   background: var(--accent);

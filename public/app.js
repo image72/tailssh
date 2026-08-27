@@ -45,23 +45,80 @@ let activeTabId = null;
 let globalIpn = null;
 
 // ─── Device list cache ────────────────────────────────────────────────────────
-// Cached for the lifetime of the page; bust with forceRefreshDevices().
+// Devices are sourced from the netmap pushes the WASM node already receives
+// after the user logs in interactively — no Tailscale API token is involved.
+// The mapped list is cached for the page lifetime; each netmap push replaces
+// it. Visibility is per-user: a peer only shows up here if the logged-in
+// identity's ACLs allow seeing it.
 /** @type {Array|null} */
 let deviceCache = null;
+/** @type {Array<function(Array|null): void>} — wake-ups for pickers waiting on the first netmap */
+const deviceWaiters = [];
 
-function forceRefreshDevices() {
-  deviceCache = null;
+const DEVICE_WAIT_TIMEOUT_MS = 10_000;
+
+/**
+ * Replace the device cache with a mapped netmap snapshot and wake any
+ * loadPicker waiting for the first push.
+ * @param {{self?: object, peers?: Array, lockedOut?: boolean}} nm
+ */
+function updateDeviceCache(nm) {
+  const peers = Array.isArray(nm?.peers) ? nm.peers : [];
+  deviceCache = peers.flatMap((p) => {
+    // Guard: skip peers with no name — p.name.split(".") would throw
+    if (!p?.name) return [];
+
+    // Netmap `online` is a nullable bool: true/false, or undefined (omitted)
+    // when the control plane has no presence data yet.
+    const online = p.online === true ? true : p.online === false ? false : null;
+    // MagicDNS FQDN e.g. "jkt02-mvn-1.taila58d0.ts.net." (trailing dot ok)
+    const displayName = p.name.split(".")[0];
+
+    return [{
+      id:          p.nodeKey ?? p.name,
+      name:        p.name,
+      displayName,
+      hostname:    displayName,
+      addresses:   p.addresses ?? [],
+      os:          "",                         // netmap does not carry OS
+      online,
+      lastSeen:    null,                       // netmap does not carry lastSeen
+      sshEnabled:  p.tailscaleSSHEnabled === true,
+    }];
+  });
+  for (const wake of deviceWaiters.splice(0)) wake(deviceCache);
 }
 
-async function fetchDevices() {
-  if (deviceCache) return deviceCache;
-  const resp = await fetch("/api/devices");
-  if (!resp.ok) {
-    const body = await resp.json().catch(() => ({}));
-    throw new Error(body.error || `HTTP ${resp.status}`);
-  }
-  deviceCache = await resp.json();
-  return deviceCache;
+/**
+ * Release cached device data and fail any pending waiters. Used on
+ * logout/relogin so stale device lists never survive an identity change.
+ */
+function clearDevices() {
+  deviceCache = null;
+  for (const wake of deviceWaiters.splice(0)) wake(null);
+}
+
+/**
+ * Resolve the current device list. Returns the cached netmap snapshot when
+ * available; otherwise waits for the next netmap push (normally within ~1s
+ * of reaching Running). Resolves null if no netmap arrives within the
+ * timeout window.
+ * @returns {Promise<Array|null>}
+ */
+function fetchDevices() {
+  if (deviceCache) return Promise.resolve(deviceCache);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      const i = deviceWaiters.indexOf(wake);
+      if (i !== -1) deviceWaiters.splice(i, 1);
+      resolve(null);
+    }, DEVICE_WAIT_TIMEOUT_MS);
+    const wake = (devices) => {
+      clearTimeout(timer);
+      resolve(devices);
+    };
+    deviceWaiters.push(wake);
+  });
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -339,7 +396,7 @@ function clearAllTabs() {
   tabs.length = 0;
   activeTabId = null;
   // Stale device data shouldn't survive a logout/reconnect cycle
-  forceRefreshDevices();
+  clearDevices();
 }
 
 // ─── Drag-and-drop reorder ───────────────────────────────────────────────────
@@ -421,7 +478,7 @@ async function loadPicker(tab, ipn) {
   refreshBtn.title = "Refresh device list";
   refreshBtn.textContent = "↻ Refresh";
   refreshBtn.addEventListener("click", () => {
-    forceRefreshDevices();
+    // Netmap data is control-pushed; refresh just re-renders the latest snapshot.
     loadPicker(tab, ipn).catch(err => console.error("[loadPicker]", err));
   });
 
@@ -446,7 +503,7 @@ async function loadPicker(tab, ipn) {
   grid.className = "device-grid";
   const loadingMsg = document.createElement("p");
   loadingMsg.style.cssText = "color:var(--muted);font-size:13px";
-  loadingMsg.textContent = deviceCache ? "Loading devices…" : "Fetching devices…";
+  loadingMsg.textContent = deviceCache ? "Loading devices…" : "Waiting for netmap…";
   grid.appendChild(loadingMsg);
 
   const errorEl = document.createElement("div");
@@ -460,12 +517,11 @@ async function loadPicker(tab, ipn) {
   pane.innerHTML = "";
   pane.appendChild(picker);
 
-  let devices;
-  try {
-    devices = await fetchDevices();
-  } catch (err) {
+  const devices = await fetchDevices();
+  if (devices === null) {
     grid.innerHTML = "";
-    errorEl.textContent = `Could not load devices: ${err.message}`;
+    errorEl.textContent =
+      "No device list received from the tailnet yet. If this persists, try logging out and back in.";
     errorEl.classList.add("visible");
     return;
   }
@@ -526,12 +582,6 @@ function buildCard(device, tab, ipn) {
   const ipv6       = addrs.find(a =>  a.includes(":")) ?? null;
   const addr       = ipv4;  // connect over IPv4
   const displayName = device.displayName || (device.name ? device.name.split(".")[0] : "unknown");
-  const canConnect  = device.online && device.sshEnabled;
-  const disabledReason = !device.online
-    ? "Device is offline"
-    : !device.sshEnabled
-    ? "Tailscale SSH not enabled on this device"
-    : null;
 
   const card = document.createElement("div");
   card.className = "device-card";
@@ -548,11 +598,14 @@ function buildCard(device, tab, ipn) {
   const nameEl = document.createElement("div");
   nameEl.className = "device-name";
   nameEl.textContent = displayName;
-  const osEl = document.createElement("div");
-  osEl.className = "device-os";
-  osEl.textContent = device.os || "unknown";
   infoEl.appendChild(nameEl);
-  infoEl.appendChild(osEl);
+  // The netmap does not carry OS info; only render the subtitle when known
+  if (device.os) {
+    const osEl = document.createElement("div");
+    osEl.className = "device-os";
+    osEl.textContent = device.os;
+    infoEl.appendChild(osEl);
+  }
 
   cardHeader.appendChild(iconEl);
   cardHeader.appendChild(infoEl);
@@ -575,20 +628,35 @@ function buildCard(device, tab, ipn) {
 
   const lastSeenEl = document.createElement("span");
   lastSeenEl.className = "device-lastseen";
-  lastSeenEl.textContent = `Last seen: ${relativeTime(device.lastSeen)}`;
-  metaEl.appendChild(lastSeenEl);
+  if (device.lastSeen) {
+    lastSeenEl.textContent = `Last seen: ${relativeTime(device.lastSeen)}`;
+    metaEl.appendChild(lastSeenEl);
+  }
 
   // ── footer ──
   const footerEl = document.createElement("div");
   footerEl.className = "device-card-footer";
 
+  // online is tri-state: true / false / null (unknown — no presence data yet)
+  const onlineState = device.online === true ? "online"
+    : device.online === false ? "offline"
+    : "unknown";
   const badgeEl = document.createElement("span");
-  badgeEl.className = `online-badge ${device.online ? "online" : "offline"}`;
-  badgeEl.textContent = device.online ? "Online" : "Offline";
+  badgeEl.className = `online-badge ${onlineState}`;
+  badgeEl.textContent = onlineState === "online" ? "Online"
+    : onlineState === "offline" ? "Offline"
+    : "Unknown";
+  if (onlineState === "unknown") badgeEl.title = "Presence unknown — connect to verify";
 
   const connectBtn = document.createElement("button");
   connectBtn.className = "connect-btn";
   connectBtn.textContent = device.sshEnabled ? "Connect" : "SSH disabled";
+  const canConnect = device.online !== false && device.sshEnabled;
+  const disabledReason = device.online === false
+    ? "Device is offline"
+    : !device.sshEnabled
+    ? "Tailscale SSH not enabled on this device"
+    : null;
   if (!canConnect) {
     connectBtn.disabled = true;
     if (disabledReason) connectBtn.title = disabledReason;
@@ -800,6 +868,7 @@ async function main() {
         const nm = JSON.parse(netMapJSON);
         console.log("[tailscale] netmap — self:", nm.self?.name,
           "peers:", nm.peers?.length ?? 0);
+        updateDeviceCache(nm);
       } catch {
         console.debug("[tailscale] netmap (raw):", netMapJSON);
       }
