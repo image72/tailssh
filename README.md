@@ -144,7 +144,7 @@ before turning it on.
   style-src 'self';
   img-src 'self' data:;
   font-src 'self';
-  connect-src 'self' https://*.tailscale.com wss://*.tailscale.com;
+  connect-src 'self' https://*.tailscale.com wss://*.tailscale.com https://log.tailscale.io;
   base-uri 'self';
   form-action 'self';
   object-src 'none'">
@@ -155,20 +155,22 @@ Why each part:
 | Directive | Rationale |
 |---|---|
 | `script-src 'self' https://unpkg.com 'wasm-unsafe-eval'` | `app.js` / `pkg.js` are same-origin; Alpine loads from unpkg; the Go runtime needs `'wasm-unsafe-eval'` to compile `main.wasm`. Self-hosting Alpine would let us drop unpkg. |
-| `connect-src 'self' https://*.tailscale.com wss://*.tailscale.com` | The browser node talks to `controlplane.tailscale.com` (netmap), `logtail.tailscale.com` (logs) and the DERP relays — all `*.tailscale.com` subdomains. Tailnet traffic (SSH, peerapi latency probes) is *tunneled inside* the DERP connection, so no per-device exceptions are needed. `wss://` is listed explicitly in case the CSP `https → wss` scheme upgrade is not honored by every browser. |
+| `connect-src 'self' https://*.tailscale.com wss://*.tailscale.com https://log.tailscale.io` | Verified against a captured session HAR (2026-08). The browser node talks to `controlplane.tailscale.com` (netmap + a persistent `wss://` watch connection), the DERP relays (https polling + `wss://` relays, hosts like `derp18d.tailscale.com` — still `*.tailscale.com`), and `log.tailscale.io` (runtime logs — note the **tailscale.io** domain, not tailscale.com). Tailnet traffic (SSH, peerapi latency probes) is *tunneled inside* the DERP connections — the HAR shows **zero** browser-level requests to `100.x` addresses, so no per-device exceptions are needed. The explicit `wss://` entries guard against browsers not honoring the CSP `https → wss` scheme upgrade. |
 | `style-src 'self'` | Requires migrating the `<noscript>` fallback out of its inline `<style>` first (e.g. an `html.no-js` class toggle); otherwise `'unsafe-inline'` would be needed. |
 | `object-src 'none'`, `base-uri 'self'`, `form-action 'self'` | Cheap hardening — the page has no plugins, forms, or scriptable bases. |
 
 ### Open questions before enforcing
 
-1. Does `https://*.tailscale.com` cover the DERP `wss://` connections in
-   every browser (CSP3 scheme upgrade), or is the explicit `wss://` entry
-   required? Verify on Chrome / Firefox / Safari.
+1. Do the explicit `wss://` entries hold everywhere, or can `https://`
+   sources be relied on to cover `wss://` (CSP3 scheme upgrade)? The HAR
+   confirms `wss://controlplane.tailscale.com` and `wss://derp*.tailscale.com`
+   are both in use. Verify on Chrome / Firefox / Safari.
 2. Custom DERP servers, if the tailnet ever configures any, must be added
    to `connect-src`.
-3. Confirm no other browser-level origins are contacted: run the policy in
-   Report-Only mode and watch the console through a full session (login,
-   picker, SSH, latency probes).
+3. ~~Confirm no other browser-level origins are contacted~~ — resolved by the
+   session HAR: the complete origin inventory is `self` (workers.dev),
+   `unpkg.com` (Alpine), `*.tailscale.com` (control / DERP) and
+   `log.tailscale.io` (logs). Re-verify after any dependency change.
 
 ### Recommended rollout
 
