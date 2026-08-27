@@ -7,20 +7,34 @@
     <link rel="stylesheet" href="style.css" />
     <link rel="stylesheet" href="pkg.css" />
   </head>
-  <body>
+  <!--
+    Everything reactive is driven by the single "tailssh" Alpine component
+    defined in app.js. Dynamic content is rendered with x-text only —
+    device names and login URLs are external data.
+  -->
+  <body x-data="tailssh">
     <!-- ─── Header ───────────────────────────────────────────────────────── -->
     <header id="header">
       <span id="logo">TailSSH</span>
-      <span id="ts-status" class="status-badge status-connecting">
+      <span id="ts-status" class="status-badge" :class="statusInfo.cls">
         <span class="dot"></span>
-        <span id="ts-status-text">Initializing…</span>
+        <span x-text="statusInfo.label">Initializing…</span>
       </span>
       <div id="header-spacer"></div>
-      <button id="logout-btn" class="header-btn" title="Logout from Tailscale" hidden>Logout</button>
+      <!-- Identity the visitor logged in as → its machine page in the console -->
+      <a class="header-link" x-cloak x-show="selfUrl" :href="selfUrl"
+         target="_blank" rel="noopener noreferrer" x-text="self?.label"></a>
+      <button id="logout-btn" class="header-btn" title="Logout from Tailscale"
+              x-show="tsState === 'Running'"
+              :disabled="logoutPending"
+              x-text="logoutPending ? 'Logging out…' : 'Logout'"
+              @click="logout()">Logout</button>
     </header>
 
     <!-- ─── Auth overlay ─────────────────────────────────────────────────── -->
-    <div id="auth-overlay" class="overlay hidden">
+    <div id="auth-overlay" class="overlay" x-cloak x-show="auth.visible"
+         x-transition:enter="ui-anim" x-transition:enter-start="ui-hidden" x-transition:enter-end="ui-visible"
+         x-transition:leave="ui-anim" x-transition:leave-start="ui-visible" x-transition:leave-end="ui-hidden">
       <div class="overlay-box">
         <h2>Tailscale Login Required</h2>
         <p>
@@ -28,46 +42,138 @@
           Once you have logged in, return to this tab — the terminal will
           connect automatically.
         </p>
-        <button id="auth-open-btn">Open Tailscale Login</button>
-        <p class="hint" id="auth-url-hint" aria-live="assertive" aria-atomic="true"></p>
+        <button @click="openLoginUrl()">Open Tailscale Login</button>
+        <p class="hint" x-text="auth.url" aria-live="assertive" aria-atomic="true"></p>
       </div>
     </div>
 
     <!-- ─── Loading overlay ──────────────────────────────────────────────── -->
-    <div id="loading-overlay" class="overlay">
+    <div id="loading-overlay" class="overlay" x-show="loading.visible"
+         x-transition:leave="ui-anim" x-transition:leave-start="ui-visible" x-transition:leave-end="ui-hidden">
       <div class="overlay-box">
         <div class="spinner"></div>
-        <p id="loading-text">Loading Tailscale WASM…</p>
+        <p x-text="loading.text">Loading Tailscale WASM…</p>
       </div>
     </div>
 
     <!-- ─── Tab bar ──────────────────────────────────────────────────────── -->
     <div id="tab-bar">
       <div id="tab-list">
-        <!-- tab buttons injected by app.js, followed by the + button -->
-        <button id="new-tab-btn" title="New tab">+</button>
+        <template x-for="tab in tabs" :key="tab.id">
+          <div class="tab" :class="{ active: tab.id === activeTabId }" :data-id="tab.id"
+               draggable="true"
+               @click="activateTab(tab.id)"
+               @dragstart="onDragStart($event, tab.id)"
+               @dragover.prevent="onDragOver($event)"
+               @dragleave="onDragLeave($event)"
+               @drop.prevent="onDrop($event, tab.id)"
+               @dragend="onDragEnd($event)">
+            <span class="tab-label" x-text="tab.label"></span>
+            <button class="tab-close" title="Close tab" @click.stop="closeTab(tab.id)">✕</button>
+          </div>
+        </template>
+        <button id="new-tab-btn" title="New tab" @click="createTab()">+</button>
       </div>
     </div>
 
     <!-- ─── Pane host ────────────────────────────────────────────────────── -->
-    <!--
-      Each tab gets one child <div class="pane"> inside here.
-      Only the active pane is visible; others have display:none.
-    -->
-    <div id="pane-host"></div>
+    <!-- One pane per tab: a device picker, or a live terminal once connected. -->
+    <div id="pane-host">
+      <template x-for="tab in tabs" :key="tab.id">
+        <div class="pane" :class="{ active: tab.id === activeTabId }" :data-id="tab.id">
+
+          <div class="picker" x-show="tab.view === 'picker'">
+            <div class="picker-header">
+              <div class="picker-header-text">
+                <h1>Choose a machine</h1>
+                <p class="picker-subtitle">Select a machine from your tailnet to open an SSH session.</p>
+              </div>
+              <button class="picker-refresh-btn" title="Refresh device list" @click="refreshPicker()">↻ Refresh</button>
+            </div>
+
+            <div class="picker-search-wrap">
+              <span class="picker-search-icon">⌕</span>
+              <input class="picker-search" type="search" placeholder="Filter by name, OS, or IP…"
+                     x-model="tab.query" autocomplete="off" spellcheck="false" />
+            </div>
+
+            <div class="device-grid">
+              <template x-if="devicesStatus === 'waiting'">
+                <p class="picker-note" x-text="devices.length ? 'Loading devices…' : 'Waiting for netmap…'"></p>
+              </template>
+              <template x-if="devicesStatus === 'unavailable'">
+                <p class="picker-error">No device list received from the tailnet yet. If this persists, try logging out and back in.</p>
+              </template>
+              <template x-if="devicesStatus === 'ready' && sortedDevices.length === 0">
+                <p class="picker-note">No devices found in your tailnet.</p>
+              </template>
+
+              <template x-for="device in filteredDevices(tab)" :key="device.id">
+                <div class="device-card">
+                  <div class="device-card-header">
+                    <div class="device-icon">💻</div>
+                    <template x-if="device.ipv4">
+                      <a class="device-name device-link" :href="deviceUrl(device)"
+                         target="_blank" rel="noopener noreferrer"
+                         :title="`Open ${device.displayName} in the Tailscale admin console`"
+                         x-text="device.displayName"></a>
+                    </template>
+                    <template x-if="!device.ipv4">
+                      <div class="device-name" x-text="device.displayName"></div>
+                    </template>
+                  </div>
+                  <div class="device-meta">
+                    <span class="device-addr" x-text="device.ipv4 ?? device.name"></span>
+                    <template x-if="device.ipv6">
+                      <span class="device-addr device-addr-v6" x-text="device.ipv6"></span>
+                    </template>
+                    <span class="device-latency" x-show="latencyLabel(device)" x-text="latencyLabel(device)"></span>
+                  </div>
+                  <div class="device-card-footer">
+                    <span class="online-badge" :class="onlineState(device)"
+                          :title="onlineState(device) === 'unknown' ? 'Presence unknown — connect to verify' : ''"
+                          x-text="onlineLabel(device)"></span>
+                    <button class="connect-btn"
+                            :class="{ connecting: isConnecting(device) }"
+                            x-text="connectLabel(device)"
+                            :disabled="connectDisabled(device)"
+                            :title="connectBlockReason(device) ?? ''"
+                            @click="openSession(tab, device)">Connect</button>
+                  </div>
+                </div>
+              </template>
+
+              <template x-if="devicesStatus === 'ready' && tab.query && filteredDevices(tab).length === 0">
+                <p class="picker-no-results" x-text="`No devices match &quot;${tab.query}&quot;.`"></p>
+              </template>
+            </div>
+          </div>
+
+          <!-- xterm mounts here imperatively once a session starts -->
+          <div class="terminal-wrap" x-show="tab.view === 'terminal'"></div>
+
+        </div>
+      </template>
+    </div>
 
     <!-- ─── Username modal ───────────────────────────────────────────────── -->
-    <div id="username-modal" class="overlay hidden" role="dialog" aria-modal="true"
-         aria-labelledby="username-modal-title">
+    <div id="username-modal" class="overlay" role="dialog" aria-modal="true"
+         aria-labelledby="username-modal-title"
+         x-cloak x-show="modal.open"
+         x-transition:enter="ui-anim" x-transition:enter-start="ui-hidden" x-transition:enter-end="ui-visible"
+         x-transition:leave="ui-anim" x-transition:leave-start="ui-visible" x-transition:leave-end="ui-hidden">
       <div class="overlay-box modal-box">
         <h2 id="username-modal-title">SSH Connection</h2>
-        <p id="username-modal-desc" class="modal-desc"></p>
+        <p class="modal-desc" x-text="modal.desc"></p>
         <label class="modal-label" for="username-input">Username</label>
         <input id="username-input" class="modal-input" type="text"
-               placeholder="e.g. root" autocomplete="username" spellcheck="false" />
+               placeholder="e.g. root" autocomplete="username" spellcheck="false"
+               x-ref="usernameInput" x-model="modal.username"
+               @keydown.enter.prevent="confirmUsername()"
+               @keydown.escape.prevent="cancelUsername()" />
         <div class="modal-actions">
-          <button id="username-cancel-btn" class="btn-secondary">Cancel</button>
-          <button id="username-connect-btn" class="btn-primary">Connect</button>
+          <button class="btn-secondary" @click="cancelUsername()">Cancel</button>
+          <button class="btn-primary" @click="confirmUsername()">Connect</button>
         </div>
       </div>
     </div>

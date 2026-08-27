@@ -1,55 +1,31 @@
 /**
- * TailSSH — Frontend entry point
+ * TailSSH — Alpine.js frontend
  *
  * Architecture:
- *  - One Tailscale WASM node shared across all tabs
- *  - Each "tab" is an object { id, tabEl, paneEl, session, label }
- *  - A tab pane is either a picker (device list) or a live terminal
- *  - Tabs are drag-reorderable via HTML5 drag-and-drop
- *  - Closing a tab gracefully closes its SSH session first
+ *  - One Alpine root component ("tailssh") owns all reactive UI state
+ *  - The netmap device cache stays module-level: it is fed by WASM IPN
+ *    callbacks rather than the UI, and every picker pane consumes it
+ *  - xterm sessions and HTML5 drag-and-drop stay imperative — Alpine is
+ *    the wrong tool for mounting terminals
+ *
+ * All dynamic content renders through x-text/textContent — device names
+ * and login URLs are external data, so no innerHTML/x-html anywhere.
  */
 
+import Alpine from "https://unpkg.com/alpinejs@3/dist/module.esm.js";
 import { createIPN, runSSHSession } from "./pkg.js";
 
-// ─── WASM environment patch ───────────────────────────────────────────────────
+// ─── WASM environment patch ──────────────────────────────────────────────────
 if (globalThis.fs) {
   globalThis.fs.cwd   = () => "/tmp";
   globalThis.fs.mkdir = (path, perm, cb) => { cb(null); };
 }
 
-// ─── DOM refs ────────────────────────────────────────────────────────────────
-const loadingOverlay   = document.getElementById("loading-overlay");
-const loadingText      = document.getElementById("loading-text");
-const authOverlay      = document.getElementById("auth-overlay");
-const authOpenBtn      = document.getElementById("auth-open-btn");
-const authUrlHint      = document.getElementById("auth-url-hint");
-const tsStatusBadge    = document.getElementById("ts-status");
-const tsStatusText     = document.getElementById("ts-status-text");
-const tabList          = document.getElementById("tab-list");
-const newTabBtn        = document.getElementById("new-tab-btn");
-const paneHost         = document.getElementById("pane-host");
-const usernameModal    = document.getElementById("username-modal");
-const usernameInput    = document.getElementById("username-input");
-const usernameModalDesc= document.getElementById("username-modal-desc");
-const usernameCancelBtn= document.getElementById("username-cancel-btn");
-const usernameConnectBtn=document.getElementById("username-connect-btn");
-const logoutBtn        = document.getElementById("logout-btn");
-
-// ─── Global state ────────────────────────────────────────────────────────────
-let pendingLoginURL = null;
-let tabIdSeq = 0;
-/** @type {Array<{id:number, tabEl:HTMLElement, paneEl:HTMLElement, session:object|null, label:string}>} */
-const tabs = [];
-let activeTabId = null;
-/** @type {object|null} — set once Tailscale is Running */
-let globalIpn = null;
-
-// ─── Device list cache ────────────────────────────────────────────────────────
-// Devices are sourced from the netmap pushes the WASM node already receives
-// after the user logs in interactively — no Tailscale API token is involved.
-// The mapped list is cached for the page lifetime; each netmap push replaces
-// it. Visibility is per-user: a peer only shows up here if the logged-in
-// identity's ACLs allow seeing it.
+// ─── Netmap device cache ─────────────────────────────────────────────────────
+// Devices are sourced from the netmap pushes the WASM node receives after the
+// user logs in interactively — no Tailscale API token is involved. Visibility
+// is per-user: a peer only shows up here if the logged-in identity's ACLs
+// allow seeing it.
 /** @type {Array|null} */
 let deviceCache = null;
 /** @type {Array<function(Array|null): void>} — wake-ups for pickers waiting on the first netmap */
@@ -59,7 +35,7 @@ const DEVICE_WAIT_TIMEOUT_MS = 10_000;
 
 /**
  * Replace the device cache with a mapped netmap snapshot and wake any
- * loadPicker waiting for the first push.
+ * picker waiting for the first push.
  * @param {{self?: object, peers?: Array, lockedOut?: boolean}} nm
  */
 function updateDeviceCache(nm) {
@@ -73,17 +49,18 @@ function updateDeviceCache(nm) {
     const online = p.online === true ? true : p.online === false ? false : null;
     // MagicDNS FQDN e.g. "jkt02-mvn-1.taila58d0.ts.net." (trailing dot ok)
     const displayName = p.name.split(".")[0];
+    const addresses = p.addresses ?? [];
 
     return [{
-      id:          p.nodeKey ?? p.name,
-      name:        p.name,
+      id: p.nodeKey ?? p.name,
+      name: p.name,
       displayName,
-      hostname:    displayName,
-      addresses:   p.addresses ?? [],
-      os:          "",                         // netmap does not carry OS
+      hostname: displayName,
+      addresses,
+      ipv4: addresses.find((a) => !a.includes(":")) ?? null,
+      ipv6: addresses.find((a) => a.includes(":")) ?? null,
       online,
-      lastSeen:    null,                       // netmap does not carry lastSeen
-      sshEnabled:  p.tailscaleSSHEnabled === true,
+      sshEnabled: p.tailscaleSSHEnabled === true,
     }];
   });
   for (const wake of deviceWaiters.splice(0)) wake(deviceCache);
@@ -121,61 +98,43 @@ function fetchDevices() {
   });
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Tailnet path latency probe ──────────────────────────────────────────────
 
-function setStatus(state) {
-  const map = {
-    NoState:          ["Initializing",  "status-connecting"],
-    InUseOtherUser:   ["In Use",        "status-stopped"],
-    NeedsLogin:       ["Needs Login",   "status-needsLogin"],
-    NeedsMachineAuth: ["Needs Auth",    "status-needsLogin"],
-    Stopped:          ["Stopped",       "status-stopped"],
-    Starting:         ["Starting",      "status-connecting"],
-    Running:          ["Connected",     "status-running"],
-  };
-  const [label, cls] = map[state] ?? ["Unknown", "status-connecting"];
-  tsStatusBadge.className = `status-badge ${cls}`;
-  tsStatusText.textContent = label;
-  logoutBtn.hidden = (state !== "Running");
-  if (state === "Running") {
-    logoutBtn.disabled = false;
-    logoutBtn.textContent = "Logout";
-  }
+const PROBE_TIMEOUT_MS = 3_000;
+
+/**
+ * Measure the effective tailnet path RTT to a device: one HTTP round trip
+ * through the WASM node's own data plane (ipn.fetch → netstack → WireGuard),
+ * the same path an SSH session will use — direct P2P or DERP-relayed.
+ *
+ * Any settle counts as a round trip: success, CORS block, or protocol error
+ * all surface after the network round trip has completed. Only a true hang
+ * (ACL drop, device offline) outruns the timeout.
+ * @returns {Promise<number|null>} RTT in ms, or null when unreachable
+ */
+async function probeDevice(ipn, hostname) {
+  if (typeof ipn?.fetch !== "function") return null;
+  const t0 = performance.now();
+  const roundTrip = ipn.fetch(`http://${hostname}`).catch(() => {});
+  const timeout = new Promise((resolve) => setTimeout(resolve, PROBE_TIMEOUT_MS));
+  return Promise.race([
+    roundTrip.then(() => Math.round(performance.now() - t0)),
+    timeout.then(() => null),
+  ]);
 }
 
-const showLoading = (msg) => {
-  loadingOverlay.classList.remove("hidden");
-  loadingText.textContent = msg;
-};
-const hideLoading = () => loadingOverlay.classList.add("hidden");
+// ─── Netmap self identity ────────────────────────────────────────────────────
 
-const showAuthOverlay = (url) => {
-  pendingLoginURL = url;
-  // Safe assignment — url is a trusted server-provided string, not user content
-  authUrlHint.textContent = url;
-  authOverlay.classList.remove("hidden");
-};
-const hideAuthOverlay = () => authOverlay.classList.add("hidden");
-
-function osIcon(os = "") {
-  const o = os.toLowerCase();
-  if (o.includes("linux"))                       return "🐧";
-  if (o.includes("darwin") || o.includes("mac")) return "🍎";
-  if (o.includes("windows"))                     return "🪟";
-  if (o.includes("android"))                     return "🤖";
-  if (o.includes("ios"))                         return "📱";
-  return "💻";
-}
-
-function relativeTime(iso) {
-  if (!iso) return "never";
-  const diff = Date.now() - new Date(iso).getTime();
-  const m = Math.floor(diff / 60000);
-  if (m < 1)  return "just now";
-  if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
-  return `${Math.floor(h / 24)}d ago`;
+/**
+ * Derive the header identity label from the self node's MagicDNS FQDN, e.g.
+ * "jackalope-stonecat.user-space.ts.net." → "jackalope-stonecat@user-space".
+ * Custom domains (no ".ts.net") fall back to the full domain.
+ */
+function parseSelfName(fqdn) {
+  const host = fqdn.replace(/\.$/, "");
+  const [hostname, ...rest] = host.split(".");
+  const tailnet = host.endsWith(".ts.net") && rest.length > 2 ? rest[0] : rest.join(".");
+  return `${hostname}@${tailnet}`;
 }
 
 // ─── localStorage username persistence ───────────────────────────────────────
@@ -193,555 +152,7 @@ function setStoredUser(hostname, username) {
   } catch {}
 }
 
-// ─── Username modal ───────────────────────────────────────────────────────────
-
-/**
- * Guard against two concurrent promptUsername calls sharing the same modal DOM.
- * The second caller receives null immediately instead of corrupting shared
- * event listeners.
- */
-let modalBusy = false;
-
-/**
- * Show the styled username modal and return a Promise that resolves with the
- * entered username string, or null if the user cancelled.
- * @param {object} device  — the device object (for displayName + hostname key)
- */
-function promptUsername(device) {
-  // Race guard: reject concurrent calls immediately
-  if (modalBusy) return Promise.resolve(null);
-  modalBusy = true;
-
-  return new Promise((resolve) => {
-    const key = device.displayName || device.name;
-
-    // Pre-fill with last-used value (or OS-appropriate default)
-    const stored = getStoredUser(key);
-    const defaultUser = stored || (device.os?.toLowerCase().includes("darwin") ? "" : "root");
-    usernameInput.value = defaultUser;
-
-    // Null-safe address display
-    const addrs = device.addresses ?? [];
-    const firstAddr = addrs[0] ?? device.name ?? key;
-    usernameModalDesc.textContent = `Connecting to ${key} (${firstAddr})`;
-
-    usernameModal.classList.remove("hidden");
-    // Focus & select all so the user can immediately type a replacement
-    usernameInput.focus();
-    usernameInput.select();
-
-    const cleanup = (result) => {
-      modalBusy = false;
-      usernameModal.classList.add("hidden");
-      offCancel();
-      offConnect();
-      offKey();
-      resolve(result);
-    };
-
-    const onConnect = () => {
-      const val = usernameInput.value.trim();
-      if (!val) { usernameInput.focus(); return; }
-      cleanup(val);
-    };
-    const onCancel = () => cleanup(null);
-    const onKey = (e) => {
-      if (e.key === "Enter")  { e.preventDefault(); onConnect(); }
-      if (e.key === "Escape") { e.preventDefault(); onCancel(); }
-    };
-
-    usernameConnectBtn.addEventListener("click", onConnect);
-    usernameCancelBtn.addEventListener("click", onCancel);
-    usernameInput.addEventListener("keydown", onKey);
-
-    // Remove listeners exactly once via named refs
-    const offConnect = () => usernameConnectBtn.removeEventListener("click", onConnect);
-    const offCancel  = () => usernameCancelBtn.removeEventListener("click", onCancel);
-    const offKey     = () => usernameInput.removeEventListener("keydown", onKey);
-  });
-}
-
-// ─── Tab manager ─────────────────────────────────────────────────────────────
-
-/**
- * Create a new tab with a picker pane and activate it.
- * @param {object} ipn  — the live Tailscale IPN instance
- * @returns the tab object
- */
-function createTab(ipn) {
-  const id = ++tabIdSeq;
-
-  // ── tab button ──
-  const tabEl = document.createElement("div");
-  tabEl.className = "tab";
-  tabEl.dataset.id = id;
-  tabEl.draggable = true;
-
-  const labelSpan = document.createElement("span");
-  labelSpan.className = "tab-label";
-  labelSpan.textContent = "New tab";
-
-  const closeBtn = document.createElement("button");
-  closeBtn.className = "tab-close";
-  closeBtn.title = "Close tab";
-  closeBtn.textContent = "✕";
-
-  tabEl.appendChild(labelSpan);
-  tabEl.appendChild(closeBtn);
-
-  closeBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    closeTab(id);
-  });
-  tabEl.addEventListener("click", () => activateTab(id));
-
-  // ── drag-and-drop reorder ──
-  tabEl.addEventListener("dragstart", onDragStart);
-  tabEl.addEventListener("dragover",  onDragOver);
-  tabEl.addEventListener("dragleave", onDragLeave);
-  tabEl.addEventListener("drop",      onDrop);
-  tabEl.addEventListener("dragend",   onDragEnd);
-
-  tabList.insertBefore(tabEl, newTabBtn);
-
-  // ── pane ──
-  const paneEl = document.createElement("div");
-  paneEl.className = "pane";
-  paneEl.dataset.id = id;
-  paneHost.appendChild(paneEl);
-
-  const tab = { id, tabEl, paneEl, session: null, label: "New tab" };
-  tabs.push(tab);
-
-  activateTab(id);
-  loadPicker(tab, ipn).catch(err => console.error("[loadPicker]", err));
-
-  return tab;
-}
-
-function getTab(id) {
-  return tabs.find(t => t.id === id) ?? null;
-}
-
-function activateTab(id) {
-  activeTabId = id;
-  for (const t of tabs) {
-    t.tabEl.classList.toggle("active", t.id === id);
-    t.paneEl.classList.toggle("active", t.id === id);
-  }
-  // Scroll the active tab into view in the tab bar
-  const tab = getTab(id);
-  if (!tab) return;
-  tab.tabEl.scrollIntoView({ block: "nearest", inline: "nearest" });
-  // If the tab has a live SSH session, focus the terminal so the user can
-  // type immediately without having to click into it first.
-  if (tab.session) {
-    // xterm.js renders a hidden textarea as its keyboard input target.
-    // Focusing it is equivalent to calling Terminal#focus().
-    const input = tab.paneEl.querySelector(".xterm-helper-textarea");
-    if (input) input.focus();
-  }
-}
-
-function setTabLabel(id, label) {
-  const tab = getTab(id);
-  if (!tab) return;
-  tab.label = label;
-  const labelEl = tab.tabEl.querySelector(".tab-label");
-  if (labelEl) labelEl.textContent = label;
-}
-
-function closeTab(id) {
-  const tab = getTab(id);
-  if (!tab) return;
-
-  // Gracefully close SSH session if one is open
-  if (tab.session) {
-    try { tab.session.close(); } catch {}
-    tab.session = null;
-  }
-
-  tab.tabEl.remove();
-  tab.paneEl.remove();
-  const idx = tabs.findIndex(t => t.id === id);
-  tabs.splice(idx, 1);
-
-  if (tabs.length === 0) {
-    // Last tab closed — open a fresh one automatically so the UI is never blank
-    if (globalIpn) createTab(globalIpn);
-    return;
-  }
-
-  // Activate nearest tab
-  if (activeTabId === id) {
-    const next = tabs[Math.min(idx, tabs.length - 1)];
-    activateTab(next.id);
-  }
-}
-
-/**
- * Silently destroy every tab (closing live SSH sessions) without triggering
- * the auto-open-new-tab behaviour. Used when the IPN node logs out so stale
- * device lists are not shown to the user.
- */
-function clearAllTabs() {
-  for (const tab of [...tabs]) {
-    if (tab.session) {
-      try { tab.session.close(); } catch {}
-      tab.session = null;
-    }
-    tab.tabEl.remove();
-    tab.paneEl.remove();
-  }
-  tabs.length = 0;
-  activeTabId = null;
-  // Stale device data shouldn't survive a logout/reconnect cycle
-  clearDevices();
-}
-
-// ─── Drag-and-drop reorder ───────────────────────────────────────────────────
-
-let dragSrcId = null;
-
-function onDragStart(e) {
-  dragSrcId = Number(e.currentTarget.dataset.id);
-  e.dataTransfer.effectAllowed = "move";
-  // Use a tiny delay so the drag image renders before we style the element
-  requestAnimationFrame(() => e.currentTarget.style.opacity = "0.4");
-}
-
-function onDragOver(e) {
-  e.preventDefault();
-  e.dataTransfer.dropEffect = "move";
-  e.currentTarget.classList.add("drag-over");
-}
-
-function onDragLeave(e) {
-  e.currentTarget.classList.remove("drag-over");
-}
-
-function onDrop(e) {
-  e.preventDefault();
-  e.currentTarget.classList.remove("drag-over");
-  const targetId = Number(e.currentTarget.dataset.id);
-  if (dragSrcId === null || dragSrcId === targetId) return;
-
-  const srcIdx = tabs.findIndex(t => t.id === dragSrcId);
-  const dstIdx = tabs.findIndex(t => t.id === targetId);
-  if (srcIdx === -1 || dstIdx === -1) return;
-
-  // Capture the destination tab's DOM element BEFORE mutating the array.
-  // After splice the indices shift, so reading tabs[dstIdx] afterwards gives
-  // the wrong element for left-to-right drags (off-by-one bug).
-  const dstTabEl = tabs[dstIdx].tabEl;
-
-  // Reorder in the array
-  const [srcTab] = tabs.splice(srcIdx, 1);
-  tabs.splice(dstIdx, 0, srcTab);
-
-  // Reorder in the DOM — insert srcTab before the original destination element
-  tabList.insertBefore(srcTab.tabEl, dstTabEl);
-}
-
-function onDragEnd(e) {
-  e.currentTarget.style.opacity = "";
-  dragSrcId = null;
-  document.querySelectorAll(".tab.drag-over").forEach(el => el.classList.remove("drag-over"));
-}
-
-// ─── Picker ──────────────────────────────────────────────────────────────────
-
-async function loadPicker(tab, ipn) {
-  setTabLabel(tab.id, "New tab");
-
-  const pane = tab.paneEl;
-
-  // Build picker DOM imperatively to avoid any innerHTML injection risk
-  const picker = document.createElement("div");
-  picker.className = "picker";
-
-  const pickerHeader = document.createElement("div");
-  pickerHeader.className = "picker-header";
-
-  const headerText = document.createElement("div");
-  headerText.className = "picker-header-text";
-  const h1 = document.createElement("h1");
-  h1.textContent = "Choose a machine";
-  const subtitle = document.createElement("p");
-  subtitle.className = "picker-subtitle";
-  subtitle.textContent = "Select a machine from your tailnet to open an SSH session.";
-  headerText.appendChild(h1);
-  headerText.appendChild(subtitle);
-
-  const refreshBtn = document.createElement("button");
-  refreshBtn.className = "picker-refresh-btn";
-  refreshBtn.title = "Refresh device list";
-  refreshBtn.textContent = "↻ Refresh";
-  refreshBtn.addEventListener("click", () => {
-    // Netmap data is control-pushed; refresh just re-renders the latest snapshot.
-    loadPicker(tab, ipn).catch(err => console.error("[loadPicker]", err));
-  });
-
-  pickerHeader.appendChild(headerText);
-  pickerHeader.appendChild(refreshBtn);
-
-  const searchWrap = document.createElement("div");
-  searchWrap.className = "picker-search-wrap";
-  const searchIcon = document.createElement("span");
-  searchIcon.className = "picker-search-icon";
-  searchIcon.textContent = "⌕";
-  const searchInput = document.createElement("input");
-  searchInput.className = "picker-search";
-  searchInput.type = "search";
-  searchInput.placeholder = "Filter by name, OS, or IP…";
-  searchInput.autocomplete = "off";
-  searchInput.spellcheck = false;
-  searchWrap.appendChild(searchIcon);
-  searchWrap.appendChild(searchInput);
-
-  const grid = document.createElement("div");
-  grid.className = "device-grid";
-  const loadingMsg = document.createElement("p");
-  loadingMsg.style.cssText = "color:var(--muted);font-size:13px";
-  loadingMsg.textContent = deviceCache ? "Loading devices…" : "Waiting for netmap…";
-  grid.appendChild(loadingMsg);
-
-  const errorEl = document.createElement("div");
-  errorEl.className = "picker-error";
-
-  picker.appendChild(pickerHeader);
-  picker.appendChild(searchWrap);
-  picker.appendChild(grid);
-  picker.appendChild(errorEl);
-
-  pane.innerHTML = "";
-  pane.appendChild(picker);
-
-  const devices = await fetchDevices();
-  if (devices === null) {
-    grid.innerHTML = "";
-    errorEl.textContent =
-      "No device list received from the tailnet yet. If this persists, try logging out and back in.";
-    errorEl.classList.add("visible");
-    return;
-  }
-
-  if (!devices.length) {
-    grid.innerHTML = "";
-    const msg = document.createElement("p");
-    msg.style.cssText = "color:var(--muted);font-size:13px";
-    msg.textContent = "No devices found in your tailnet.";
-    grid.appendChild(msg);
-    return;
-  }
-
-  // Sort: SSH-enabled first, then online, then alphabetically
-  devices.sort((a, b) => {
-    if (a.sshEnabled !== b.sshEnabled) return a.sshEnabled ? -1 : 1;
-    if (a.online     !== b.online)     return a.online     ? -1 : 1;
-    return (a.displayName || a.name || "").localeCompare(b.displayName || b.name || "");
-  });
-
-  // Build all cards once; show/hide based on search query
-  const cards = devices.map(d => ({ device: d, el: buildCard(d, tab, ipn) }));
-
-  const renderCards = (query) => {
-    const q = query.trim().toLowerCase();
-    grid.innerHTML = "";
-    let shown = 0;
-    for (const { device: d, el } of cards) {
-      const haystack = [
-        d.displayName, d.hostname, d.os, ...(d.addresses ?? [])
-      ].join(" ").toLowerCase();
-      if (!q || haystack.includes(q)) {
-        grid.appendChild(el);
-        shown++;
-      }
-    }
-    if (shown === 0) {
-      const msg = document.createElement("p");
-      msg.className = "picker-no-results";
-      msg.textContent = `No devices match "${query}".`;
-      grid.appendChild(msg);
-    }
-  };
-
-  renderCards("");
-  searchInput.addEventListener("input", () => renderCards(searchInput.value));
-  // Auto-focus the search bar (convenience for power users)
-  searchInput.focus();
-}
-
-/**
- * Build a device card DOM node without using innerHTML for dynamic content,
- * eliminating XSS risk from device names/OS/IP fields.
- */
-function buildCard(device, tab, ipn) {
-  const addrs      = device.addresses ?? [];
-  const ipv4       = addrs.find(a => !a.includes(":")) ?? device.name ?? "";
-  const ipv6       = addrs.find(a =>  a.includes(":")) ?? null;
-  const addr       = ipv4;  // connect over IPv4
-  const displayName = device.displayName || (device.name ? device.name.split(".")[0] : "unknown");
-
-  const card = document.createElement("div");
-  card.className = "device-card";
-
-  // ── header ──
-  const cardHeader = document.createElement("div");
-  cardHeader.className = "device-card-header";
-
-  const iconEl = document.createElement("div");
-  iconEl.className = "device-icon";
-  iconEl.textContent = osIcon(device.os);
-
-  const infoEl = document.createElement("div");
-  const nameEl = document.createElement("div");
-  nameEl.className = "device-name";
-  nameEl.textContent = displayName;
-  infoEl.appendChild(nameEl);
-  // The netmap does not carry OS info; only render the subtitle when known
-  if (device.os) {
-    const osEl = document.createElement("div");
-    osEl.className = "device-os";
-    osEl.textContent = device.os;
-    infoEl.appendChild(osEl);
-  }
-
-  cardHeader.appendChild(iconEl);
-  cardHeader.appendChild(infoEl);
-
-  // ── meta ──
-  const metaEl = document.createElement("div");
-  metaEl.className = "device-meta";
-
-  const ipv4El = document.createElement("span");
-  ipv4El.className = "device-addr";
-  ipv4El.textContent = ipv4;
-  metaEl.appendChild(ipv4El);
-
-  if (ipv6) {
-    const ipv6El = document.createElement("span");
-    ipv6El.className = "device-addr device-addr-v6";
-    ipv6El.textContent = ipv6;
-    metaEl.appendChild(ipv6El);
-  }
-
-  const lastSeenEl = document.createElement("span");
-  lastSeenEl.className = "device-lastseen";
-  if (device.lastSeen) {
-    lastSeenEl.textContent = `Last seen: ${relativeTime(device.lastSeen)}`;
-    metaEl.appendChild(lastSeenEl);
-  }
-
-  // ── footer ──
-  const footerEl = document.createElement("div");
-  footerEl.className = "device-card-footer";
-
-  // online is tri-state: true / false / null (unknown — no presence data yet)
-  const onlineState = device.online === true ? "online"
-    : device.online === false ? "offline"
-    : "unknown";
-  const badgeEl = document.createElement("span");
-  badgeEl.className = `online-badge ${onlineState}`;
-  badgeEl.textContent = onlineState === "online" ? "Online"
-    : onlineState === "offline" ? "Offline"
-    : "Unknown";
-  if (onlineState === "unknown") badgeEl.title = "Presence unknown — connect to verify";
-
-  const connectBtn = document.createElement("button");
-  connectBtn.className = "connect-btn";
-  connectBtn.textContent = device.sshEnabled ? "Connect" : "SSH disabled";
-  const canConnect = device.online !== false && device.sshEnabled;
-  const disabledReason = device.online === false
-    ? "Device is offline"
-    : !device.sshEnabled
-    ? "Tailscale SSH not enabled on this device"
-    : null;
-  if (!canConnect) {
-    connectBtn.disabled = true;
-    if (disabledReason) connectBtn.title = disabledReason;
-  }
-
-  footerEl.appendChild(badgeEl);
-  footerEl.appendChild(connectBtn);
-
-  card.appendChild(cardHeader);
-  card.appendChild(metaEl);
-  card.appendChild(footerEl);
-
-  if (canConnect) {
-    connectBtn.addEventListener("click", () =>
-      openSession(tab, device, addr, displayName, ipn).catch(err =>
-        console.error("[openSession]", err)
-      )
-    );
-  }
-  return card;
-}
-
-// ─── SSH session ──────────────────────────────────────────────────────────────
-
-async function openSession(tab, device, addr, displayName, ipn) {
-  // Guard: if a session is already active on this tab, do nothing
-  if (tab.session) return;
-
-  const user = await promptUsername(device);
-  if (!user) return;  // cancelled
-
-  // Guard again after async promptUsername (another click could have snuck in)
-  if (tab.session) return;
-
-  // Persist username for next time (pre-fills the modal on subsequent opens)
-  setStoredUser(device.displayName || device.name, user);
-
-  const label = `${user}@${displayName}`;
-  setTabLabel(tab.id, label);
-
-  // Replace pane content with a terminal wrapper
-  tab.paneEl.innerHTML = "";
-  const termEl = document.createElement("div");
-  termEl.className = "terminal-wrap";
-  tab.paneEl.appendChild(termEl);
-
-  let closed = false;
-
-  const session = runSSHSession(
-    termEl,
-    { hostname: addr, username: user, timeoutSeconds: 30 },
-    ipn,
-    {
-      onConnectionProgress(msg) { console.log(`[ssh:${label}] progress:`, msg); },
-      onConnected() {
-        console.log(`[ssh:${label}] connected`);
-        // Focus the terminal as soon as the connection is up
-        const input = tab.paneEl.querySelector(".xterm-helper-textarea");
-        if (input) input.focus();
-      },
-      onError(err) {
-        console.error(`[ssh:${label}] error:`, err);
-        if (!closed) onSessionEnd(tab, ipn);
-      },
-      onDone() {
-        console.log(`[ssh:${label}] done`);
-        if (!closed) onSessionEnd(tab, ipn);
-      },
-    },
-    xtermOptions()
-  );
-
-  tab.session = {
-    close() {
-      closed = true;
-      try { session?.close?.(); } catch {}
-    },
-  };
-}
-
-function onSessionEnd(tab, ipn) {
-  tab.session = null;
-  tab.paneEl.innerHTML = "";
-  loadPicker(tab, ipn).catch(err => console.error("[onSessionEnd→loadPicker]", err));
-}
+// ─── xterm options ───────────────────────────────────────────────────────────
 
 function xtermOptions() {
   return {
@@ -774,119 +185,480 @@ function xtermOptions() {
   };
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+// ─── Alpine root component ───────────────────────────────────────────────────
 
-async function main() {
-  // ── Boot Tailscale WASM ──────────────────────────────────────────────
-  showLoading("Loading Tailscale WASM…");
-  let ipn;
-  try {
-    ipn = await createIPN({
-      stateStorage: {
-        setState(id, value) { try { sessionStorage.setItem(`ts:${id}`, value); } catch {} },
-        getState(id)        { try { return sessionStorage.getItem(`ts:${id}`) ?? ""; } catch { return ""; } },
-      },
-      panicHandler(err) {
-        console.error("[tailscale] panic:", err);
-        // panicHandler is synchronous; show the error directly
-        showLoading(`Tailscale crashed: ${err}`);
-        clearAllTabs();
-      },
+Alpine.data("tailssh", () => ({
+
+  // ── state ──
+  tsState: "NoState",
+  loading: { visible: true, text: "Loading Tailscale WASM…" },
+  auth: { visible: false, url: "" },
+  logoutPending: false,
+  /** @type {Array<{id:number, label:string, view:'picker'|'terminal', sessionDeviceId:number|null, query:string}>} */
+  tabs: [],
+  activeTabId: null,
+  tabSeq: 0,
+  dragSrcId: null,
+  /** Live SSH sessions keyed by device id: { state, tabId, close } — global so
+   *  every picker pane reflects which devices are busy */
+  sessions: {},
+  devices: [],
+  devicesStatus: "waiting",   // waiting | ready | unavailable
+  latencies: {},              // device id → "probing" | RTT ms | null (unreachable)
+  loginTimer: null,
+  everRan: false,
+  ipn: null,
+  self: null,                 // { label, ipv4 } — set from the first netmap
+  modal: { open: false, username: "", desc: "", resolve: null },
+
+  async init() {
+    try {
+      this.ipn = await createIPN({
+        stateStorage: {
+          setState: (id, value) => { try { sessionStorage.setItem(`ts:${id}`, value); } catch {} },
+          getState: (id) => { try { return sessionStorage.getItem(`ts:${id}`) ?? ""; } catch { return ""; } },
+        },
+        panicHandler: (err) => {
+          console.error("[tailscale] panic:", err);
+          this.showLoading(`Tailscale crashed: ${err}`);
+          this.clearAllTabs();
+        },
+      });
+    } catch (err) {
+      console.error(err);
+      this.showLoading(`Failed to load Tailscale: ${err.message}`);
+      return;
+    }
+
+    // Confirm before leaving while any SSH session is alive. Browsers ignore
+    // window.confirm inside beforeunload and show their native leave dialog.
+    window.addEventListener("beforeunload", (event) => this.onBeforeUnload(event));
+
+    this.ipn.run({
+      notifyState:       (state) => this.onState(state),
+      notifyBrowseToURL: (url)   => this.onBrowseToURL(url),
+      notifyNetMap:      (json)  => this.onNetMap(json),
+      notifyPanicRecover: (err)  => this.onPanic(err),
     });
-  } catch (err) {
-    showLoading(`Failed to load Tailscale: ${err.message}`);
-    console.error(err);
-    return;
-  }
+  },
 
-  // ── Start IPN state machine ──────────────────────────────────────────
-  let loginTimer = null;
-  let buttonsWired = false;
+  get statusInfo() {
+    const map = {
+      NoState:          ["Initializing",  "status-connecting"],
+      InUseOtherUser:   ["In Use",        "status-stopped"],
+      NeedsLogin:       ["Needs Login",   "status-needsLogin"],
+      NeedsMachineAuth: ["Needs Auth",    "status-needsLogin"],
+      Stopped:          ["Stopped",       "status-stopped"],
+      Starting:         ["Starting",      "status-connecting"],
+      Running:          ["Connected",     "status-running"],
+    };
+    const [label, cls] = map[this.tsState] ?? ["Unknown", "status-connecting"];
+    return { label, cls };
+  },
 
-  const scheduleLogin = () => {
-    if (loginTimer !== null) clearTimeout(loginTimer);
-    loginTimer = setTimeout(() => {
-      loginTimer = null;
+  // ── IPN callbacks ──
+
+  onState(state) {
+    console.log("[tailscale] state →", state);
+    this.tsState = state;
+    switch (state) {
+      case "Running":
+        if (this.loginTimer !== null) { clearTimeout(this.loginTimer); this.loginTimer = null; }
+        this.auth.visible = false;
+        this.loading.visible = false;
+        this.logoutPending = false;
+        this.everRan = true;
+        // Open a fresh tab on every arrival at Running (including after re-login)
+        if (this.tabs.length === 0) this.createTab();
+        break;
+      case "NeedsLogin":
+      case "NeedsMachineAuth":
+        this.clearAllTabs();
+        this.showLoading("Waiting for Tailscale authentication…");
+        this.scheduleLogin();
+        break;
+      case "Stopped":
+        this.clearAllTabs();
+        // Only a post-Running stop is an error; boot-time Stopped is normal
+        if (this.everRan) this.showLoading("Tailscale node stopped unexpectedly.");
+        break;
+    }
+  },
+
+  onBrowseToURL(url) {
+    console.log("[tailscale] login URL:", url);
+    this.loading.visible = false;
+    this.auth.url = url;
+    this.auth.visible = true;
+    window.open(url, "_blank", "noopener,noreferrer");
+  },
+
+  onNetMap(netMapJSON) {
+    try {
+      const nm = JSON.parse(netMapJSON);
+      console.log("[tailscale] netmap — self:", nm.self?.name,
+        "peers:", nm.peers?.length ?? 0);
+      updateDeviceCache(nm);
+      // Header identity: the ephemeral node the visitor logged in as
+      if (nm.self?.name) {
+        const selfAddrs = nm.self.addresses ?? [];
+        this.self = {
+          label: parseSelfName(nm.self.name),
+          ipv4: selfAddrs.find((a) => !a.includes(":")) ?? null,
+        };
+      }
+    } catch {
+      console.debug("[tailscale] netmap (raw):", netMapJSON);
+    }
+  },
+
+  onPanic(err) {
+    console.error("[tailscale] panic:", err);
+    this.clearAllTabs();
+    this.showLoading(`Tailscale panic: ${err}`);
+  },
+
+  // ── boot helpers ──
+
+  showLoading(text) {
+    this.loading.visible = true;
+    this.loading.text = text;
+  },
+
+  scheduleLogin() {
+    // Defer by a tick so the state handler settles before login starts
+    if (this.loginTimer !== null) clearTimeout(this.loginTimer);
+    this.loginTimer = setTimeout(() => {
+      this.loginTimer = null;
       console.log("[tailscale] calling ipn.login() (deferred)");
-      ipn.login();
+      this.ipn.login();
     }, 0);
-  };
+  },
 
-  // Track whether the IPN has ever reached Running so we can detect
-  // post-Running Stopped/panic transitions that would otherwise be swallowed
-  // by the already-settled ipnRunning Promise.
-  let ipnEverRan = false;
+  clearAllTabs() {
+    for (const session of Object.values(this.sessions)) session.close?.();
+    this.sessions = {};
+    this.tabs = [];
+    this.activeTabId = null;
+    // Stale device data must not survive a logout/relogin cycle
+    clearDevices();
+    this.devices = [];
+    this.devicesStatus = "waiting";
+    this.latencies = {};
+  },
 
-  ipn.run({
-    notifyState(state) {
-      console.log("[tailscale] state →", state);
-      setStatus(state);
-      switch (state) {
-        case "Running":
-          if (loginTimer !== null) { clearTimeout(loginTimer); loginTimer = null; }
-          hideAuthOverlay();
-          hideLoading();
-          ipnEverRan = true;
-          // Wire buttons and open first tab only once
-          if (!buttonsWired) {
-            buttonsWired = true;
-            globalIpn = ipn;
-            newTabBtn.addEventListener("click", () => createTab(ipn));
-            logoutBtn.addEventListener("click", () => {
-              logoutBtn.disabled = true;
-              logoutBtn.textContent = "Logging out…";
-              ipn.logout();
-            });
-          }
-          // Open a fresh tab every time we reach Running (including after re-login)
-          if (tabs.length === 0) createTab(ipn);
-          break;
-        case "NeedsLogin":
-        case "NeedsMachineAuth":
-          clearAllTabs();
-          showLoading("Waiting for Tailscale authentication…");
-          scheduleLogin();
-          break;
-        case "Stopped":
-          clearAllTabs();
-          if (ipnEverRan) {
-            // Post-Running stop: surface the error directly rather than relying
-            // on a rejected Promise that is already settled.
-            showLoading("Tailscale node stopped unexpectedly.");
-          }
-          break;
+  // ── tabs ──
+
+  createTab() {
+    if (this.tsState !== "Running") return;   // "+" is inert before login
+    const id = ++this.tabSeq;
+    this.tabs.push({ id, label: "New tab", view: "picker", sessionDeviceId: null, query: "" });
+    this.activateTab(id);
+    this.loadPickerData();
+  },
+
+  closeTab(id) {
+    const idx = this.tabs.findIndex((t) => t.id === id);
+    if (idx === -1) return;
+    const [tab] = this.tabs.splice(idx, 1);
+    this.closeSession(tab.sessionDeviceId);
+
+    if (this.tabs.length === 0) {
+      this.createTab();   // never leave the workspace blank
+      return;
+    }
+    if (this.activeTabId === id) {
+      this.activateTab(this.tabs[Math.min(idx, this.tabs.length - 1)].id);
+    }
+  },
+
+  activateTab(id) {
+    this.activeTabId = id;
+    this.$nextTick(() => {
+      document
+        .querySelector(`#tab-list .tab[data-id="${id}"]`)
+        ?.scrollIntoView({ block: "nearest", inline: "nearest" });
+      // Jump straight into the terminal when a live session is on this tab
+      if (this.tabs.some((t) => t.id === id && t.session)) {
+        document
+          .querySelector(`.pane[data-id="${id}"] .xterm-helper-textarea`)
+          ?.focus();
       }
-    },
-    notifyBrowseToURL(url) {
-      console.log("[tailscale] login URL:", url);
-      hideLoading();
-      showAuthOverlay(url);
-      window.open(url, "_blank", "noopener,noreferrer");
-    },
-    notifyNetMap(netMapJSON) {
-      try {
-        const nm = JSON.parse(netMapJSON);
-        console.log("[tailscale] netmap — self:", nm.self?.name,
-          "peers:", nm.peers?.length ?? 0);
-        updateDeviceCache(nm);
-      } catch {
-        console.debug("[tailscale] netmap (raw):", netMapJSON);
-      }
-    },
-    notifyPanicRecover(err) {
-      console.error("[tailscale] panic:", err);
-      clearAllTabs();
-      // Surface post-Running panics directly; the Promise machinery won't help.
-      showLoading(`Tailscale panic: ${err}`);
-    },
-  });
-}
+    });
+  },
 
-authOpenBtn.addEventListener("click", () => {
-  if (pendingLoginURL) window.open(pendingLoginURL, "_blank", "noopener,noreferrer");
-});
+  logout() {
+    this.logoutPending = true;
+    this.ipn.logout();
+  },
 
-main().catch((err) => {
-  console.error("[TailSSH] Fatal error:", err);
-  showLoading(`Fatal error: ${err.message}`);
-});
+  onBeforeUnload(event) {
+    if (Object.keys(this.sessions).length === 0) return;
+    event.preventDefault();
+    event.returnValue = "";   // required by Chrome to raise the leave dialog
+  },
+
+  // ── device picker ──
+
+  async loadPickerData() {
+    const devices = await fetchDevices();
+    if (devices === null) {
+      this.devicesStatus = "unavailable";
+      return;
+    }
+    this.devices = devices;
+    this.devicesStatus = "ready";
+    this.probeLatencies();
+  },
+
+  refreshPicker() {
+    this.loadPickerData();
+    this.probeLatencies(true);
+  },
+
+  get sortedDevices() {
+    // SSH-enabled first, then online, then alphabetically
+    return [...this.devices].sort((a, b) => {
+      if (a.sshEnabled !== b.sshEnabled) return a.sshEnabled ? -1 : 1;
+      if (a.online     !== b.online)     return a.online     ? -1 : 1;
+      return (a.displayName || a.name || "").localeCompare(b.displayName || b.name || "");
+    });
+  },
+
+  filteredDevices(tab) {
+    const q = tab.query.trim().toLowerCase();
+    if (!q) return this.sortedDevices;
+    return this.sortedDevices.filter((d) =>
+      [d.displayName, d.hostname, ...d.addresses].join(" ").toLowerCase().includes(q));
+  },
+
+  // ── device card helpers ──
+
+  onlineState(device) {
+    return device.online === true ? "online"
+      : device.online === false ? "offline"
+      : "unknown";
+  },
+
+  onlineLabel(device) {
+    return { online: "Online", offline: "Offline", unknown: "Unknown" }[this.onlineState(device)];
+  },
+
+  canConnect(device) {
+    // Unknown presence may still connect — the SSH attempt is authoritative
+    return device.online !== false && device.sshEnabled;
+  },
+
+  /**
+   * Probe devices lacking a latency sample. Fire-and-forget; Refresh
+   * (force=true) re-measures every device.
+   */
+  probeLatencies(force = false) {
+    if (typeof this.ipn?.fetch !== "function") return;
+    for (const device of this.devices) {
+      if (!force && device.id in this.latencies) continue;
+      this.latencies[device.id] = "probing";
+      probeDevice(this.ipn, device.ipv4 ?? device.name).then((ms) => {
+        // Skip stale results after a clear (logout/relogin)
+        if (device.id in this.latencies) this.latencies[device.id] = ms;
+      });
+    }
+  },
+
+  latencyLabel(device) {
+    const r = this.latencies[device.id];
+    if (r === "probing")       return "probing…";
+    if (r === null)            return "unreachable";
+    if (typeof r === "number") return `${r}ms`;
+    return "";
+  },
+
+  isSessionTarget(device) {
+    return this.sessions[device.id] !== undefined;
+  },
+
+  isConnecting(device) {
+    return this.sessions[device.id]?.state === "connecting";
+  },
+
+  connectLabel(device) {
+    const state = this.sessions[device.id]?.state;
+    if (state === "connected")  return "Connected";
+    if (state === "connecting") return "Connecting…";
+    return device.sshEnabled ? "Connect" : "SSH disabled";
+  },
+
+  connectDisabled(device) {
+    return this.isSessionTarget(device) || !this.canConnect(device);
+  },
+
+  connectBlockReason(device) {
+    if (this.isSessionTarget(device)) return null;   // the label already says it
+    if (device.online === false) return "Device is offline";
+    if (!device.sshEnabled)      return "Tailscale SSH not enabled on this device";
+    return null;
+  },
+
+  deviceUrl(device) {
+    return `https://console.tailscale.com/admin/machines/${device.ipv4}`;
+  },
+
+  get selfUrl() {
+    return this.self?.ipv4
+      ? `https://console.tailscale.com/admin/machines/${this.self.ipv4}`
+      : null;
+  },
+
+  // ── SSH sessions ──
+
+  async openSession(tab, device) {
+    // One session per device (reflected in every picker) and per pane —
+    // also re-checked after the async username prompt
+    if (this.isSessionTarget(device) || tab.sessionDeviceId !== null || tab.view === "terminal") return;
+
+    const user = await this.promptUsername(device);
+    if (user === null || this.isSessionTarget(device) || tab.sessionDeviceId !== null || tab.view === "terminal") return;
+
+    setStoredUser(device.displayName || device.name, user);
+    tab.label = `${user}@${device.displayName || device.name.split(".")[0]}`;
+
+    // Card feedback for the whole handshake: spinner → "Connected". The pane
+    // stays on the picker until the session is live; the hidden terminal
+    // mount self-heals via pkg's ResizeObserver/FitAddon on reveal.
+    tab.sessionDeviceId = device.id;
+    this.sessions[device.id] = { state: "connecting", tabId: tab.id, close: null };
+
+    let closed = false;
+    const session = runSSHSession(
+      document.querySelector(`.pane[data-id="${tab.id}"] .terminal-wrap`),
+      { hostname: device.ipv4 ?? device.name, username: user, timeoutSeconds: 30 },
+      this.ipn,
+      {
+        onConnectionProgress: (msg) => console.log(`[ssh:${tab.label}] progress:`, msg),
+        onConnected: () => {
+          console.log(`[ssh:${tab.label}] connected`);
+          if (this.sessions[device.id]) this.sessions[device.id].state = "connected";
+          tab.view = "terminal";
+          this.$nextTick(() => {
+            document
+              .querySelector(`.pane[data-id="${tab.id}"] .xterm-helper-textarea`)
+              ?.focus();
+          });
+        },
+        onError: (err) => {
+          console.error(`[ssh:${tab.label}] error:`, err);
+          if (!closed) this.endSession(device.id);
+        },
+        onDone: () => {
+          console.log(`[ssh:${tab.label}] done`);
+          if (!closed) this.endSession(device.id);
+        },
+      },
+      xtermOptions(),
+    );
+
+    this.sessions[device.id].close = () => {
+      closed = true;
+      try { session?.close?.(); } catch {}
+    };
+  },
+
+  closeSession(deviceId) {
+    if (deviceId === null) return;
+    const session = this.sessions[deviceId];
+    delete this.sessions[deviceId];
+    session?.close?.();
+  },
+
+  endSession(deviceId) {
+    const session = this.sessions[deviceId];
+    delete this.sessions[deviceId];
+    const tab = this.tabs.find((t) => t.id === session?.tabId);
+    if (tab && tab.sessionDeviceId === deviceId) {
+      tab.sessionDeviceId = null;
+      tab.view = "picker";
+    }
+    this.loadPickerData();
+  },
+
+  // ── username modal ──
+
+  promptUsername(device) {
+    // Concurrent opens share one modal — the second caller bails immediately
+    if (this.modal.open) return Promise.resolve(null);
+
+    const key = device.displayName || device.name;
+    const addrs = device.addresses ?? [];
+    return new Promise((resolve) => {
+      this.modal = {
+        open: true,
+        resolve,
+        username: getStoredUser(key) || "root",
+        desc: `Connecting to ${key} (${addrs[0] ?? device.name ?? key})`,
+      };
+      this.$nextTick(() => {
+        this.$refs.usernameInput.focus();
+        this.$refs.usernameInput.select();
+      });
+    });
+  },
+
+  confirmUsername() {
+    const username = this.modal.username.trim();
+    if (!username) {
+      this.$refs.usernameInput.focus();
+      return;
+    }
+    this.modal.resolve(username);
+    this.modal.open = false;
+    this.modal.resolve = null;
+  },
+
+  cancelUsername() {
+    this.modal.resolve?.(null);
+    this.modal.open = false;
+    this.modal.resolve = null;
+  },
+
+  // ── drag-and-drop tab reorder ──
+
+  onDragStart(event, id) {
+    this.dragSrcId = id;
+    event.dataTransfer.effectAllowed = "move";
+    // Let the drag image render before dimming the source element
+    requestAnimationFrame(() => (event.currentTarget.style.opacity = "0.4"));
+  },
+
+  onDragOver(event) {
+    event.dataTransfer.dropEffect = "move";
+    event.currentTarget.classList.add("drag-over");
+  },
+
+  onDragLeave(event) {
+    event.currentTarget.classList.remove("drag-over");
+  },
+
+  onDrop(event, targetId) {
+    event.currentTarget.classList.remove("drag-over");
+    const srcId = this.dragSrcId;
+    this.dragSrcId = null;
+    if (srcId === null || srcId === targetId) return;
+
+    const srcIdx = this.tabs.findIndex((t) => t.id === srcId);
+    const dstIdx = this.tabs.findIndex((t) => t.id === targetId);
+    if (srcIdx === -1 || dstIdx === -1) return;
+
+    // Keyed x-for reconciles the DOM order — mutating the array is enough
+    const [srcTab] = this.tabs.splice(srcIdx, 1);
+    this.tabs.splice(dstIdx, 0, srcTab);
+  },
+
+  onDragEnd(event) {
+    event.currentTarget.style.opacity = "";
+    this.dragSrcId = null;
+    document.querySelectorAll(".tab.drag-over")
+      .forEach((el) => el.classList.remove("drag-over"));
+  },
+}));
+
+Alpine.start();

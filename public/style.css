@@ -8,6 +8,9 @@
   padding: 0;
 }
 
+/* Alpine hides x-cloak elements until it initializes (prevents overlay flash) */
+[x-cloak] { display: none !important; }
+
 :root {
   /* Clean minimal dark palette */
   --bg:        #1c1c1e;   /* near-black background */
@@ -64,6 +67,17 @@ html, body {
   transition: border-color 0.15s, color 0.15s;
 }
 .header-btn:hover { border-color: var(--red); color: var(--red); }
+
+.header-link {
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 500;
+  text-decoration: none;
+  padding: 4px 12px;
+  border-radius: var(--radius);
+  transition: color 0.15s;
+}
+.header-link:hover { color: var(--accent); }
 
 #logo {
   font-weight: 700;
@@ -315,6 +329,10 @@ html, body {
   word-break: break-all;
 }
 
+/* Device names link to their machine page in the admin console */
+.device-link { text-decoration: none; }
+.device-link:hover { color: var(--accent); }
+
 .device-os {
   font-size: 11px;
   color: var(--muted);
@@ -329,6 +347,12 @@ html, body {
 }
 
 .device-addr {
+  font-family: "SF Mono", "Fira Code", monospace;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.device-latency {
   font-family: "SF Mono", "Fira Code", monospace;
   font-size: 11px;
   color: var(--muted);
@@ -385,6 +409,10 @@ html, body {
   font-weight: 600;
   cursor: pointer;
   transition: opacity 0.15s;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
 }
 .connect-btn:hover  { opacity: 0.85; }
 .connect-btn:disabled {
@@ -392,6 +420,21 @@ html, body {
   color: var(--muted);
   cursor: not-allowed;
   opacity: 1;
+}
+/* Inline spinner while the SSH handshake runs */
+.connect-btn.connecting::before {
+  content: "";
+  width: 10px;
+  height: 10px;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+.picker-note {
+  color: var(--muted);
+  font-size: 13px;
 }
 
 .picker-error {
@@ -402,9 +445,7 @@ html, body {
   padding: 16px 20px;
   color: var(--red);
   font-size: 13px;
-  display: none;
 }
-.picker-error.visible { display: block; }
 
 /* ── Terminal pane ───────────────────────────────────────────── */
 .terminal-wrap {
@@ -445,6 +486,11 @@ html, body {
   backdrop-filter: blur(4px);
 }
 .overlay.hidden { display: none; }
+
+/* Alpine fade+scale transitions (wired via x-transition:* attributes) */
+.ui-anim    { transition: opacity 0.18s ease, transform 0.18s ease; }
+.ui-hidden  { opacity: 0; transform: scale(0.97); }
+.ui-visible { opacity: 1; transform: scale(1); }
 
 /* Loading overlay sits above everything except auth, so it can't block
    the "Open Tailscale Login" button when both are visible. */
