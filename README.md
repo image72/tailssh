@@ -128,6 +128,71 @@ up to 50 users) before sharing the URL with anyone.
 
 ---
 
+## Content Security Policy (planned)
+
+The site is pure static assets, so a policy can only ship as a `<meta>` tag
+in `index.html` (or a `_headers` file — see rollout below). Nothing is
+enforced yet; this is the target policy and the open questions to settle
+before turning it on.
+
+### Draft policy
+
+```html
+<meta http-equiv="Content-Security-Policy" content="
+  default-src 'self';
+  script-src 'self' https://unpkg.com 'wasm-unsafe-eval';
+  style-src 'self';
+  img-src 'self' data:;
+  font-src 'self';
+  connect-src 'self' https://*.tailscale.com wss://*.tailscale.com;
+  base-uri 'self';
+  form-action 'self';
+  object-src 'none'">
+```
+
+Why each part:
+
+| Directive | Rationale |
+|---|---|
+| `script-src 'self' https://unpkg.com 'wasm-unsafe-eval'` | `app.js` / `pkg.js` are same-origin; Alpine loads from unpkg; the Go runtime needs `'wasm-unsafe-eval'` to compile `main.wasm`. Self-hosting Alpine would let us drop unpkg. |
+| `connect-src 'self' https://*.tailscale.com wss://*.tailscale.com` | The browser node talks to `controlplane.tailscale.com` (netmap), `logtail.tailscale.com` (logs) and the DERP relays — all `*.tailscale.com` subdomains. Tailnet traffic (SSH, peerapi latency probes) is *tunneled inside* the DERP connection, so no per-device exceptions are needed. `wss://` is listed explicitly in case the CSP `https → wss` scheme upgrade is not honored by every browser. |
+| `style-src 'self'` | Requires migrating the `<noscript>` fallback out of its inline `<style>` first (e.g. an `html.no-js` class toggle); otherwise `'unsafe-inline'` would be needed. |
+| `object-src 'none'`, `base-uri 'self'`, `form-action 'self'` | Cheap hardening — the page has no plugins, forms, or scriptable bases. |
+
+### Open questions before enforcing
+
+1. Does `https://*.tailscale.com` cover the DERP `wss://` connections in
+   every browser (CSP3 scheme upgrade), or is the explicit `wss://` entry
+   required? Verify on Chrome / Firefox / Safari.
+2. Custom DERP servers, if the tailnet ever configures any, must be added
+   to `connect-src`.
+3. Confirm no other browser-level origins are contacted: run the policy in
+   Report-Only mode and watch the console through a full session (login,
+   picker, SSH, latency probes).
+
+### Recommended rollout
+
+Meta tags cannot carry `frame-ancestors` / `X-Frame-Options`
+(clickjacking protection needs real headers). Workers static assets
+support a `_headers` file in the assets directory, which is the better
+home for the final policy:
+
+```
+# public/_headers
+/*
+  Content-Security-Policy: <same policy, plus frame-ancestors 'none'>
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+  Permissions-Policy: camera=(), microphone=(), geolocation=()
+```
+
+Suggested sequence: add `public/_headers` with
+`Content-Security-Policy-Report-Only`, browse the whole app, fix any
+reported violations, then switch the header to enforcing
+`Content-Security-Policy`.
+
+---
+
 ## Project structure
 
 ```
