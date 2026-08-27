@@ -209,7 +209,10 @@ tailssh/
     ├── app.js          # Browser entry point
     ├── alpine.esm.js   # Vendored Alpine 3.16.3 (no third-party script origin)
     ├── pkg.js          # @tailscale/connect ESM bundle (build output)
-    ├── main.wasm       # Tailscale WASM binary (build output)
+    ├── wasm-url.js     # One-liner exposing the hashed wasm path (build output)
+    ├── _headers        # Custom response headers (immutable wasm caching; CSP later)
+    ├── assets/
+    │   └── main.<hash>.wasm  # Tailscale WASM binary (build output, immutable cache)
     └── pkg.css         # xterm.js base styles (build output)
 ```
 
@@ -222,7 +225,7 @@ ESM script that copies three files out of `node_modules/@tailscale/connect` into
 | File | What it is |
 |---|---|
 | `pkg.js` | Self-contained ESM bundle — includes xterm.js, FitAddon, WebLinksAddon, the `wasm_exec` shim, and the `createIPN` / `runSSHSession` exports. |
-| `main.wasm` | The Go WASM binary (~32 MB). Kept as a separate file so the browser can use `WebAssembly.instantiateStreaming()` — inlining it into JS would break streaming compilation and exceed size limits. |
+| `assets/main.<hash>.wasm` | The Go WASM binary (~22 MB), copied under a content-hash name and served with `Cache-Control: immutable` (see `public/_headers`), so repeat visits never re-download it. Kept as a separate file so the browser can use `WebAssembly.instantiateStreaming()` — inlining it into JS would break streaming compilation and exceed size limits. `app.js` learns the path from `wasm-url.js` via `createIPN({ wasmURL })`. |
 | `pkg.css` | xterm.js base stylesheet shipped by `@tailscale/connect`. |
 
 `pkg.js` is already a self-contained bundle; re-bundling it through a tool like

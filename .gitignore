@@ -4,7 +4,8 @@ node_modules/
 # Build outputs (vendored from node_modules by build.js)
 public/pkg.js
 public/pkg.css
-public/main.wasm
+public/assets/
+public/wasm-url.js
 
 # Local dev secrets — never commit
 .dev.vars

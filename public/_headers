@@ -1,0 +1,9 @@
+# Immutable content-hash caching for the large wasm binary. Small files rely
+# on the default max-age=0/must-revalidate so they always stay fresh.
+# NOTE: the CSP will be enforced here later (see README "Content Security Policy").
+
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/index.html
+  Cache-Control: no-cache

@@ -214,6 +214,7 @@ Alpine.data("tailssh", () => ({
   async init() {
     try {
       this.ipn = await createIPN({
+        wasmURL: globalThis.WASM_URL,   // content-hashed path from wasm-url.js
         stateStorage: {
           setState: (id, value) => { try { sessionStorage.setItem(`ts:${id}`, value); } catch {} },
           getState: (id) => { try { return sessionStorage.getItem(`ts:${id}`) ?? ""; } catch { return ""; } },
