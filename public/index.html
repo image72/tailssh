@@ -133,6 +133,9 @@
                     <span class="online-badge" :class="onlineState(device)"
                           :title="onlineState(device) === 'unknown' ? 'Presence unknown — connect to verify' : ''"
                           x-text="onlineLabel(device)"></span>
+                    <button class="proxy-btn"
+                            title="Proxy a TCP port on this device through the tailnet"
+                            @click="openProxy(tab, device)">Proxy…</button>
                     <button class="connect-btn"
                             :class="{ connecting: isConnecting(device) }"
                             x-text="connectLabel(device)"

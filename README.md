@@ -75,6 +75,152 @@ npm run build        # vendors pkg.js / main.wasm / pkg.css into public/
 
 ---
 
+## Port proxy (`/proxy/<device>/<port>/…`)
+
+Besides SSH, the app can proxy **HTTP traffic to any TCP port on any tailnet
+device** through generated URLs:
+
+```
+/proxy/<device>/<port>/<path>?<query>
+```
+
+Examples:
+
+```
+/proxy/aliyun-yl/3000/package.json     → http://<aliyun-yl's tailnet IP>:3000/package.json
+/proxy/100.81.0.16/8080/admin          → http://100.81.0.16:8080/admin
+/proxy/mbp/5900/                       → any HTTP service on mbp:5900
+```
+
+The device segment accepts a MagicDNS short name (`aliyun-yl`), a full FQDN
+(`aliyun-yl.tailnet.ts.net.`), or a bare tailnet IP.
+
+### How it works
+
+Cloudflare Workers cannot open arbitrary outbound TCP connections, and the
+browser WASM node cannot listen on ports — so neither side can serve the
+proxy alone. The feature chains three pieces together:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant T as Proxy tab<br/>(GET /proxy/dev/3000/x)
+    participant SW as Service Worker<br/>(proxy-sw.js)
+    participant H as App tab — proxy host<br/>(app.js + WASM node)
+    participant D as Target device<br/>(dev:3000, via tailnet)
+
+    T->>SW: fetch /proxy/dev/3000/x
+    SW->>SW: parse device + port,<br/>strip hop-by-hop headers
+    SW->>H: proxy-request {method, origin, path}<br/>via MessagePort
+    H->>H: resolve device → tailnet IP<br/>(netmap cache)
+    H->>D: ipn.fetch("http://<ip>:3000/x")<br/>(DERP-relayed)
+    D-->>H: HTTP response
+    H-->>SW: proxy-response {status, bodyBase64}
+    SW-->>T: Response (sniffed content-type,<br/>x-proxied-by: tailssh-proxy)
+
+    Note over SW,H: No host page open? SW waits 10 s,<br/>then 502 "no proxy host page is open"
+```
+
+1. **`public/proxy-sw.js`** — a Service Worker scoped to the whole app. It
+   intercepts `fetch` for `/proxy/*` URLs, extracts `<device>` and `<port>`,
+   strips hop-by-hop headers, and forwards the request to the app page over a
+   `MessageChannel` port. If no host page is open it waits up to 10 s, then
+   returns `502 "no proxy host page is open"`.
+2. **`public/app.js` (proxy host)** — the main app tab registers itself as the
+   host (`startProxyHost()` at module load). For each request it resolves the
+   device name to a tailnet IP via the netmap cache (the WASM node has no DNS
+   resolver), then calls `ipn.fetch("http://<ip>:<port><path>")`.
+3. **The WASM node** dials the target through the tailnet (DERP-relayed for
+   browser WASM — see the tailvnc notes for why direct UDP is impossible
+   here) and returns `{status, statusText, text()}`.
+
+Because `ipn.fetch()` in the current `@tailscale/connect` build is **GET-only
+and returns no response headers**, the host layer:
+
+- rejects non-GET/HEAD methods with an explicit error (no silent POST→GET
+  downgrade),
+- sniffs `content-type` from the body (HTML/JSON/plain) so proxied pages and
+  APIs render correctly.
+
+### Requirements & limitations
+
+- **The main app tab must stay open** — it is the proxy engine. Closing it
+  makes in-flight and new proxy requests fail with `502` after the host
+  timeout. A proxy URL opened directly (e.g. from a bookmark) works only
+  while another tab has the app open; the SW holds the request until a host
+  registers or the 10 s timeout fires.
+- **GET/HEAD only** — the pinned `@tailscale/connect` (1.39.98, and the
+  latest 1.102.3 alike) exposes no raw-TCP `ipn.tcp()`; that method exists
+  only in the tailscale repo's unmerged `origin/vnc` branch (which tailvnc's
+  submodule uses). Upgrading the npm package does not add it.
+- **Device must be in the netmap** — names are resolved from the ephemeral
+  node's own netmap, so ACL visibility rules apply exactly as for SSH.
+- **Auth is shared with the app** — the proxy reuses the logged-in WASM node;
+  there is no separate credential surface.
+- Response headers from the target are not preserved (single sniffed
+  `content-type`); `content-encoding`/`transfer-encoding` are stripped so the
+  browser can decode the plain body.
+
+### Testing the proxy
+
+1. Start the dev server and open the app:
+
+   ```sh
+   npm run dev
+   # open http://localhost:8787 and complete Tailscale login
+   ```
+
+2. Start a test listener on any tailnet device (here: `mbp`, on its tailnet
+   IP, so the WASM node can reach it):
+
+   ```sh
+   ssh mbp 'while true; do echo "HELLO-FROM-MBP-$(date +%s)" | nc -l 100.81.0.12 9999 >/dev/null; done'
+   ```
+
+3. In the app, click **Proxy…** on a device card and enter the port, or open
+   the URL directly:
+
+   ```
+   http://localhost:8787/proxy/mbp/9999/
+   ```
+
+   Expected: the page renders `HELLO-FROM-MBP-<timestamp>` (one line per
+   reload — the `nc` listener serves one connection then exits).
+
+4. Test a real HTTP service (device running anything on :3000):
+
+   ```
+   http://localhost:8787/proxy/aliyun-yl/3000/package.json
+   ```
+
+   Expected: the target's `package.json` JSON, served with
+   `application/json` and an `x-proxied-by: tailssh-proxy` header.
+
+5. Error paths worth exercising:
+
+   | URL | Expected |
+   |---|---|
+   | `/proxy/mbp/99999/` | `400` — `invalid port "99999"` |
+   | `/proxy/bad_..name/80/` | `400` — `invalid device` |
+   | `/proxy/mbp/9999/` (listener down) | `502` — dial/timeout error from `ipn.fetch` |
+   | `/proxy/mbp/9999/` with app tab closed | `502` — `no proxy host page is open` (after 10 s) |
+
+**Important:** the proxy only works in a browser — `curl` cannot exercise it
+(Service Workers don't run outside browsers; curl just gets the SPA fallback
+`index.html`). When testing locally, also bypass any system HTTP proxy for
+localhost (`curl --noproxy '*'` / `NO_PROXY=127.0.0.1,localhost`), otherwise
+a local proxy like `127.0.0.1:7890` intercepts the request.
+
+**Service Worker caching gotcha:** after changing `proxy-sw.js` or the proxy
+code in `app.js`, a normal reload may keep serving the **old** worker (SW
+updates are asynchronous and only take over after all tabs close, unless
+`skipWaiting` fires). If you see stale behavior such as
+`{"error":"bad path /…"}`, unregister first: DevTools → Application →
+Service Workers → **Unregister** (or Application → Storage → Clear site
+data), then hard-reload (Cmd+Shift+R).
+
+---
+
 ## Deployment
 
 ### 1. First deploy
@@ -206,7 +352,8 @@ tailssh/
 └── public/
     ├── index.html
     ├── style.css
-    ├── app.js          # Browser entry point
+    ├── app.js          # Browser entry point (SSH sessions + proxy host)
+    ├── proxy-sw.js     # Service Worker: /proxy/<device>/<port>/ interception
     ├── alpine.esm.js   # Vendored Alpine 3.16.3 (no third-party script origin)
     ├── pkg.js          # @tailscale/connect ESM bundle (build output)
     ├── wasm-url.js     # One-liner exposing the hashed wasm path (build output)

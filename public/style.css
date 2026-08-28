@@ -421,6 +421,22 @@ html, body {
   cursor: not-allowed;
   opacity: 1;
 }
+
+.proxy-btn {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 5px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.proxy-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
 /* Inline spinner while the SSH handshake runs */
 .connect-btn.connecting::before {
   content: "";

@@ -225,6 +225,8 @@ Alpine.data("tailssh", () => ({
           this.clearAllTabs();
         },
       });
+      // Expose for the proxy host (module-level startProxyHost reads this)
+      window.__tailsshIPN = this.ipn;
     } catch (err) {
       console.error(err);
       this.showLoading(`Failed to load Tailscale: ${err.message}`);
@@ -508,6 +510,31 @@ Alpine.data("tailssh", () => ({
     return `https://console.tailscale.com/admin/machines/${device.ipv4}`;
   },
 
+  // ── port proxy ──
+
+  /**
+   * Proxy URL for a device port: /proxy/<device>/<port>/ — served by the
+   * service worker through this page's WASM tailscale node. The device
+   * segment is the MagicDNS short name (stable across IP changes).
+   */
+  proxyUrl(device, port) {
+    const name = device.displayName || device.name.split(".")[0];
+    return `/proxy/${encodeURIComponent(name)}/${port}/`;
+  },
+
+  /** Prompt for a port and open the proxy URL in a new tab. */
+  async openProxy(tab, device) {
+    const name = device.displayName || device.name.split(".")[0];
+    const input = prompt(`Port on ${name} to proxy:`, "80");
+    if (input === null) return;
+    const port = Number(input.trim());
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+      alert(`Invalid port: ${input}`);
+      return;
+    }
+    window.open(this.proxyUrl(device, port), "_blank", "noopener");
+  },
+
   get selfUrl() {
     return this.self?.ipv4
       ? `https://console.tailscale.com/admin/machines/${this.self.ipv4}`
@@ -665,5 +692,132 @@ Alpine.data("tailssh", () => ({
       .forEach((el) => el.classList.remove("drag-over"));
   },
 }));
+
+// ─── Proxy host: serve /proxy/<device>/<port>/ requests from the SW ─────────
+// The Cloudflare Worker cannot reach tailnet IPs; this page's WASM node can.
+// The SW forwards proxied HTTP requests here over a MessagePort, and we speak
+// HTTP through the WASM node's ipn.fetch() (this @tailscale/connect build —
+// 1.39.98-t02582083d, 2023-03 — exposes run/login/logout/ssh/fetch only; the
+// raw-TCP ipn.tcp() arrived in later tsconnect builds).
+
+const PROXY_SW_URL = "./proxy-sw.js";
+
+/** @type {MessagePort|null} */
+let proxyHostPort = null;
+
+function bytesToBase64(bytes) {
+  let bin = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
+
+/**
+ * Resolve a device reference to a tailnet IP. Accepts a bare IPv4 or a
+ * MagicDNS name (short form "mbp" or FQDN "mbp.tailnet.ts.net."). The WASM
+ * node has no DNS resolver, so names must be mapped via the netmap cache.
+ * @returns {Promise<string|null>} tailnet IPv4 or null if unknown
+ */
+async function resolveDeviceHost(host) {
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return host; // already an IP
+  const devices = await fetchDevices();
+  if (!devices) return null;
+  const lower = host.toLowerCase().replace(/\.$/, "");
+  const dev = devices.find((d) =>
+    d.displayName === lower ||
+    d.hostname === lower ||
+    d.name.toLowerCase().replace(/\.$/, "") === lower);
+  return dev?.ipv4 ?? null;
+}
+
+/**
+ * HTTP GET through the WASM node's ipn.fetch(). The old build's fetch is
+ * GET-only and returns no response headers, so the content type is sniffed
+ * from the body to keep JSON/HTML rendering usable in the browser.
+ * @returns {Promise<{status: number, statusText: string, headers: Object, body: Uint8Array}>}
+ */
+async function ipnFetch(ipn, host, port, method, path) {
+  if (typeof ipn.fetch !== "function") {
+    throw new Error("this tailscale.wasm build exposes no ipn.fetch — cannot proxy");
+  }
+  if (method !== "GET" && method !== "HEAD") {
+    throw new Error(`proxy supports GET only (got ${method}) — this tailscale.wasm build has no raw TCP`);
+  }
+  const ip = await resolveDeviceHost(host);
+  if (!ip) throw new Error(`unknown device "${host}" — not in netmap (or still loading)`);
+  const url = `http://${ip}:${port}${path || "/"}`;
+  const res = await ipn.fetch(url);
+  const text = await res.text();
+  const body = new TextEncoder().encode(text);
+  // Header-less response: sniff a usable content type for browser rendering.
+  let contentType = "text/plain; charset=utf-8";
+  const head = text.slice(0, 200).trimStart();
+  if (/^<\s*(!doctype|html)/i.test(head)) contentType = "text/html; charset=utf-8";
+  else if (/^[[{]/.test(head)) contentType = "application/json";
+  return {
+    status: res.status,
+    statusText: res.statusText ?? "",
+    headers: { "content-type": contentType },
+    body,
+  };
+}
+
+/**
+ * Register this page as the SW's proxy host and start serving requests.
+ * Safe to call multiple times (e.g. after reload the SW replaces the port).
+ */
+async function startProxyHost(getIPN) {
+  if (!("serviceWorker" in navigator)) return;
+  try {
+    const reg = await navigator.serviceWorker.register(PROXY_SW_URL);
+    await navigator.serviceWorker.ready;
+    const channel = new MessageChannel();
+    proxyHostPort = channel.port1;
+
+    proxyHostPort.onmessage = async (event) => {
+      const msg = event.data;
+      if (!msg || msg.type !== "proxy-request") return;
+      const reply = (payload) => proxyHostPort.postMessage({ type: "proxy-response", id: msg.id, ...payload });
+
+      // The SW already extracted device/port into msg.origin ("http://<device>:<port>")
+      // and stripped the /proxy/<device>/<port> prefix from msg.path — no URL
+      // re-validation needed here, just dial and relay.
+      const ipn = getIPN();
+      if (!ipn) { reply({ error: "tailscale node not ready" }); return; }
+
+      try {
+        // msg.origin is "http://<device>:<port>" — split it for the dial.
+        const originUrl = new URL(msg.origin);
+        const resp = await ipnFetch(
+          ipn,
+          originUrl.hostname,
+          Number(originUrl.port) || 80,
+          msg.method,
+          msg.path,
+        );
+        reply({
+          status: resp.status,
+          statusText: resp.statusText,
+          headers: resp.headers,
+          bodyBase64: bytesToBase64(resp.body),
+        });
+      } catch (err) {
+        reply({ error: String(err?.message ?? err) });
+      }
+    };
+
+    proxyHostPort.start();
+    reg.active?.postMessage({ type: "proxy-host-register" }, [channel.port2]);
+    console.log("[proxy] host registered with service worker");
+  } catch (err) {
+    console.warn("[proxy] host registration failed:", err);
+  }
+}
+
+// Start the proxy host once the IPN exists (module scope — Alpine component
+// calls into this via window.__tailsshProxyHost if needed).
+startProxyHost(() => window.__tailsshIPN ?? null);
 
 Alpine.start();
