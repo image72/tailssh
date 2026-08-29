@@ -5,7 +5,7 @@ node_modules/
 public/pkg.js
 public/pkg.css
 public/assets/
-public/wasm-url.js
+public/config.js
 
 # Local dev secrets — never commit
 .dev.vars

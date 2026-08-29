@@ -133,7 +133,7 @@
                     <span class="online-badge" :class="onlineState(device)"
                           :title="onlineState(device) === 'unknown' ? 'Presence unknown — connect to verify' : ''"
                           x-text="onlineLabel(device)"></span>
-                    <button class="proxy-btn"
+                    <button class="proxy-btn" x-cloak x-show="$data.proxyEnabled"
                             title="Proxy a TCP port on this device through the tailnet"
                             @click="openProxy(tab, device)">Proxy…</button>
                     <button class="connect-btn"
@@ -181,7 +181,8 @@
       </div>
     </div>
 
-    <script src="wasm-url.js"></script>
+    <!-- Generated bootstrap (hashed wasm path + feature flags) must load before app.js -->
+    <script src="config.js"></script>
     <script type="module" src="app.js"></script>
     <noscript>
       <style>
