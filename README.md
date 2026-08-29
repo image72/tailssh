@@ -95,6 +95,26 @@ Examples:
 The device segment accepts a MagicDNS short name (`aliyun-yl`), a full FQDN
 (`aliyun-yl.tailnet.ts.net.`), or a bare tailnet IP.
 
+### Feature switch
+
+The port proxy is **off by default**. Enable it at build/deploy time:
+
+```sh
+TAILSSH_PROXY=1 npm run deploy
+```
+
+The flag is baked into `public/config.js` by `build.js` (from the
+`TAILSSH_PROXY` env var — `1`/`true`/`yes`/`on` enable it). When disabled:
+
+- `proxy-sw.js` is **never registered**, so `/proxy/*` URLs are not
+  intercepted (they fall through to the SPA fallback);
+- the **"Proxy…" button is hidden** on device cards;
+- any **previously-installed SW is unregistered** on next visit, so a
+  redeploy with the flag off cleanly removes old interception.
+
+> **Browser-only.** This path works only in a browser (Service Worker + the
+> app tab's WASM node).
+
 ### How it works
 
 Cloudflare Workers cannot open arbitrary outbound TCP connections, and the
@@ -221,14 +241,150 @@ data), then hard-reload (Cmd+Shift+R).
 
 ---
 
+## Persistent proxy via relay agent (`/p/<device>/<port>/…`)
+
+The browser proxy above has two hard constraints: it only works in a browser,
+and it dies when the app tab closes. The Worker-side `/p/*` route removes both
+— `curl`, scripts, and any HTTP client can reach **any device, any port** on
+the tailnet through the deployed Worker, with no app tab open and **no
+Tailscale Funnel**.
+
+### How it works
+
+A Worker cannot `fetch()` a tailnet IP (`100.x` is CGNAT space — no route from
+Cloudflare's edge), and running the Tailscale WASM node inside a Worker is not
+possible (the ~32 MB `main.wasm` exceeds the 3/10 MB Worker size limit, and
+the node's interactive login has no headless path). Instead, a tiny Node agent
+(`agent/agent.mjs`, zero npm dependencies) runs on any always-on tailnet
+device, connects **out** to the Worker's Durable Object over WebSocket, and
+dials proxy targets using the tailscaled daemon **already on that machine**:
+
+```mermaid
+flowchart LR
+    C[curl / scripts / any client] -->|"GET /p/aliyun-yl/3000/ + x-proxy-key"| W["Worker /p/*<br/>(PROXY_KEY check)"]
+    W -->|stub.fetch| DO["ProxyRelay<br/>Durable Object"]
+    A["agent (Node, on e.g. aliyun-yl)<br/>outbound WSS to /agent-ws"] -->|WebSocket| DO
+    DO -->|req frames| A
+    A -->|"http.request(aliyun-yl:3000)<br/>via existing tailscaled"| D[Target device:port]
+    A -->|streamed response frames| DO
+```
+
+Key properties:
+
+- **No Funnel / Serve** — nothing is exposed publicly; the agent only makes
+  *outbound* WSS connections to Cloudflare.
+- **One agent = whole tailnet** — the agent dials any device:port its
+  tailscaled can reach (MagicDNS names or 100.x IPs), so a single deployment
+  covers every machine. No per-device setup.
+- **Full HTTP** — all methods, streaming request/response bodies, response
+  headers preserved (hop-by-hop stripped), tagged `x-proxied-by: tailssh-relay`.
+- **Resilient** — the DO uses WebSocket hibernation (free keep-alive), the
+  agent reconnects with exponential backoff.
+
+### One-time setup
+
+1. **Worker side**:
+
+   ```sh
+   npx wrangler secret put PROXY_KEY    # client auth for /p/*
+   npx wrangler secret put RELAY_KEY    # agent auth for /agent-ws
+   npm run deploy
+   ```
+
+2. **Agent side** — on one always-on tailnet device (Node ≥ 22):
+
+   ```sh
+   RELAY_URL=wss://tailssh.<you>.workers.dev/agent-ws \
+   RELAY_KEY=<RELAY_KEY> \
+   node agent/agent.mjs
+   ```
+
+   Optional hardening: `ALLOW_DEVICES=aliyun-yl,mini` restricts which devices
+   the agent will dial (comma-separated, empty = all). `PORT=0` disables the
+   local health endpoint (default `127.0.0.1:8785`).
+
+   For a persistent setup, run it under systemd/launchd/pm2 — e.g.:
+
+   ```ini
+   # /etc/systemd/system/tailssh-agent.service
+   [Unit]
+   Description=tailssh relay agent
+   After=network-online.target
+
+   [Service]
+   Environment=RELAY_URL=wss://tailssh.<you>.workers.dev/agent-ws
+   EnvironmentFile=/etc/default/tailssh-agent   # RELAY_KEY=… ALLOW_DEVICES=…
+   ExecStart=/usr/bin/node /opt/tailssh/agent/agent.mjs
+   Restart=always
+   RestartSec=5
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+### Usage
+
+```sh
+# Header auth (recommended)
+curl -H "x-proxy-key: $PROXY_KEY" https://tailssh.<you>.workers.dev/p/aliyun-yl/3000/package.json
+
+# Or query param
+curl "https://tailssh.<you>.workers.dev/p/100.81.0.16/8080/admin?key=$PROXY_KEY"
+```
+
+The device segment accepts a MagicDNS short name (`aliyun-yl`), a full FQDN,
+or a bare tailnet IP — resolved by the agent's machine via tailscaled.
+
+### Error paths
+
+| Case | Response |
+|---|---|
+| Missing/invalid `PROXY_KEY` | `401` — `missing or invalid proxy key` |
+| Bad device name / port | `400` — `invalid device` / `invalid port` |
+| Agent not running | `502` — `relay agent not connected` |
+| Target unreachable / hung | `502` — dial error, or `relay timed out after 120s` |
+| `PROXY_KEY`/`RELAY_KEY` secret not set | `503` — `… secret is not configured` |
+
+### Security notes
+
+- Both surfaces are authenticated: `/p/*` with `PROXY_KEY`, `/agent-ws` with
+  `RELAY_KEY` (the agent is an outbound dialer — no inbound ports anywhere).
+- The agent can reach **your whole tailnet**, so treat `RELAY_KEY` as highly
+  sensitive and consider `ALLOW_DEVICES` to bound the blast radius.
+- The Worker never forwards `x-proxy-key` or `cf-*` headers upstream.
+- For stronger protection, front `/p/*` with Cloudflare Access.
+
+### Why not run the Tailscale node inside the Worker?
+
+Investigated and ruled out: `main.wasm` is ~32 MB (Worker limit: 3 MB free /
+10 MB paid, compressed), the 1 s Worker startup budget can't absorb compiling
+it, the pinned `@tailscale/connect` build exposes no auth-key login path for
+headless use, and the binary is built for browsers (`wasm_exec` +
+`sessionStorage`), not the Workers runtime. The browser SW proxy works because
+the node runs **in the browser** — the SW is just a router. Tailscale
+Funnel/Serve was also rejected: each device can bind its certificate domain
+to only one service, so it cannot cover "any device, any port" — which the
+single relay agent does.
+
+---
+
 ## Deployment
 
 ### 1. First deploy
 
 If this is your first deploy, Wrangler will create the project automatically.
-There is no server-side code — the deployment is pure static assets served by
-Cloudflare's Workers infrastructure. The name is set in `wrangler.jsonc`
-(`"name": "tailssh"`). Change it there if you want a different subdomain.
+The Worker code (`src/index.js`) only handles the `/f/*` funnel proxy route —
+everything else is pure static assets served by Cloudflare's Workers
+infrastructure. The name is set in `wrangler.jsonc` (`"name": "tailssh"`).
+Change it there if you want a different subdomain.
+
+Before deploying, set the two relay-proxy secrets (see
+[Persistent proxy via relay agent](#persistent-proxy-via-relay-agent-pdeviceport)):
+
+```sh
+npx wrangler secret put PROXY_KEY
+npx wrangler secret put RELAY_KEY
+```
 
 ### 2. Deploy
 
@@ -259,11 +415,9 @@ up to 50 users) before sharing the URL with anyone.
 
 ## Security notes
 
-- There is **no server-side code, no secrets and no Tailscale credentials** —
-  the deployment is pure static assets.
-- Each browser session creates an **ephemeral** Tailscale node under the
-  identity the visitor logs in with; the node disappears from that tailnet
-  automatically when the tab is closed.
+- The **browser app** holds no Tailscale credentials: each session creates an
+  **ephemeral** Tailscale node under the identity the visitor logs in with;
+  the node disappears from that tailnet automatically when the tab is closed.
 - The device list comes from the ephemeral node's own netmap, so it only ever
   contains peers the logged-in user's tailnet ACLs let them see. Users see
   their own tailnet — never the deployer's.
@@ -271,6 +425,13 @@ up to 50 users) before sharing the URL with anyone.
   stored or transmitted by this app.
 - Tailscale ACLs govern which users can SSH into which machines. TailSSH does
   not bypass them.
+- The **`/p/*` relay proxy is the one server-side surface**: it reaches
+  *the deployer's* tailnet (via the relay agent's tailscaled), so it requires
+  the `PROXY_KEY` secret on every request (`401` otherwise). The agent
+  endpoint `/agent-ws` separately requires `RELAY_KEY`. The agent only makes
+  outbound connections — no inbound ports anywhere. Treat both keys as
+  sensitive — set them with `wrangler secret put`, never in `wrangler.jsonc`
+  or git.
 
 ---
 
@@ -356,7 +517,7 @@ tailssh/
     ├── proxy-sw.js     # Service Worker: /proxy/<device>/<port>/ interception
     ├── alpine.esm.js   # Vendored Alpine 3.16.3 (no third-party script origin)
     ├── pkg.js          # @tailscale/connect ESM bundle (build output)
-    ├── wasm-url.js     # One-liner exposing the hashed wasm path (build output)
+    ├── config.js       # Generated bootstrap: hashed wasm path + feature flags
     ├── _headers        # Custom response headers (immutable wasm caching; CSP later)
     ├── assets/
     │   └── main.<hash>.wasm  # Tailscale WASM binary (build output, immutable cache)
@@ -372,7 +533,8 @@ ESM script that copies three files out of `node_modules/@tailscale/connect` into
 | File | What it is |
 |---|---|
 | `pkg.js` | Self-contained ESM bundle — includes xterm.js, FitAddon, WebLinksAddon, the `wasm_exec` shim, and the `createIPN` / `runSSHSession` exports. |
-| `assets/main.<hash>.wasm` | The Go WASM binary (~22 MB), copied under a content-hash name and served with `Cache-Control: immutable` (see `public/_headers`), so repeat visits never re-download it. Kept as a separate file so the browser can use `WebAssembly.instantiateStreaming()` — inlining it into JS would break streaming compilation and exceed size limits. `app.js` learns the path from `wasm-url.js` via `createIPN({ wasmURL })`. |
+| `assets/main.<hash>.wasm` | The Go WASM binary (~22 MB), copied under a content-hash name and served with `Cache-Control: immutable` (see `public/_headers`), so repeat visits never re-download it. Kept as a separate file so the browser can use `WebAssembly.instantiateStreaming()` — inlining it into JS would break streaming compilation and exceed size limits. `app.js` learns the path from `config.js` via `createIPN({ wasmURL })`. |
+| `config.js` | Generated bootstrap script (loaded before `app.js`): exposes the hashed wasm path as `globalThis.WASM_URL` and build-time feature flags as `globalThis.TAILSSH_CONFIG` (e.g. `proxyEnabled` from `TAILSSH_PROXY`). |
 | `pkg.css` | xterm.js base stylesheet shipped by `@tailscale/connect`. |
 
 `pkg.js` is already a self-contained bundle; re-bundling it through a tool like
