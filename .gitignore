@@ -9,3 +9,7 @@ public/config.js
 
 # Local dev secrets — never commit
 .dev.vars
+
+# Local tool artifacts
+.omo/
+.playwright-mcp/
